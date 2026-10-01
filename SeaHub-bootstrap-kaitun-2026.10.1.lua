@@ -5276,6 +5276,9 @@ function RolandSecurity:_runVmArtifact(artifact, ...)
 		pc = pc + 1
 		if operation == "PUSH_CONST" then
 			push(constants[argument + 1])
+		elseif operation == "GET_ARG" then
+			if argument < 0 or argument >= supplied.n then return false, "vm-argument-invalid" end
+			push(supplied[argument + 1])
 		elseif operation == "GET_GLOBAL" then
 			local name = constants[argument + 1]
 			if type(name) ~= "string" then return false, "vm-global-name-invalid" end
@@ -5302,12 +5305,46 @@ function RolandSecurity:_runVmArtifact(artifact, ...)
 		elseif operation == "EQ" then
 			local right, left = pop(), pop()
 			push(left == right)
+		elseif operation == "NE" then
+			local right, left = pop(), pop()
+			push(left ~= right)
+		elseif operation == "LT" then
+			local right, left = pop(), pop()
+			push(left < right)
+		elseif operation == "LTE" then
+			local right, left = pop(), pop()
+			push(left <= right)
+		elseif operation == "GT" then
+			local right, left = pop(), pop()
+			push(left > right)
+		elseif operation == "GTE" then
+			local right, left = pop(), pop()
+			push(left >= right)
+		elseif operation == "NOT" then
+			push(not pop())
+		elseif operation == "NEG" then
+			push(-pop())
 		elseif operation == "ADD" then
 			local right, left = pop(), pop()
 			push(left + right)
+		elseif operation == "SUB" then
+			local right, left = pop(), pop()
+			push(left - right)
+		elseif operation == "MUL" then
+			local right, left = pop(), pop()
+			push(left * right)
+		elseif operation == "DIV" then
+			local right, left = pop(), pop()
+			push(left / right)
 		elseif operation == "CONCAT" then
 			local right, left = pop(), pop()
 			push(tostring(left) .. tostring(right))
+		elseif operation == "AND" then
+			local right, left = pop(), pop()
+			push(left and right)
+		elseif operation == "OR" then
+			local right, left = pop(), pop()
+			push(left or right)
 		elseif operation == "JUMP" then
 			pc = argument + 1
 		elseif operation == "JUMP_IF_FALSE" then
