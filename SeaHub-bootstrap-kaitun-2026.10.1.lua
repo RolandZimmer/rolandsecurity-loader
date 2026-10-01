@@ -5168,6 +5168,8 @@ end
 
 
 local __RLS_StopBusy = false
+local __RLS_KickBusy = false
+local __RLS_BlacklistMessage = "YOUR KEY HAS BEEN BLACKLISTED FOR INTENTIONALLY TAKING OUR SOURCECODE."
 local function __RLS_StopSeaHub(reason)
 	if __RLS_StopBusy then return end
 	__RLS_StopBusy = true
@@ -5177,6 +5179,33 @@ local function __RLS_StopSeaHub(reason)
 		pcall(controller.stop, controller)
 	end
 	__RLS_StopBusy = false
+end
+
+local function __RLS_KickPlayer(message)
+	if __RLS_KickBusy then return end
+	__RLS_KickBusy = true
+	local players = game:GetService("Players")
+	local player = players.LocalPlayer
+	if player then
+		pcall(player.Kick, player, tostring(message))
+	end
+end
+
+local function __RLS_EnforceSecurityKick(reason)
+	__RLS_StopSeaHub(reason)
+	if reason == "local-correlation" or reason == "server-decision" then
+		__RLS_KickPlayer(__RLS_BlacklistMessage)
+	end
+end
+
+local function __RLS_EnforceServerStop(code)
+	__RLS_StopSeaHub(code)
+	local normalized = tostring(code or "SESSION_TERMINATED"):upper()
+	if normalized:find("BLACKLIST", 1, true) then
+		__RLS_KickPlayer(__RLS_BlacklistMessage)
+	else
+		__RLS_KickPlayer("YOUR ACCESS HAS BEEN TERMINATED.")
+	end
 end
 
 local previousRuntime = rawget(__RLS_Environment, "__ROLAND_SECURITY_RUNTIME")
@@ -5208,8 +5237,8 @@ local runtime = RolandSecurity.new({
 	queue = { maxQueuedEvents = 48, maxEventsPerMinute = 60, dedupSeconds = 60, maxDedupEntries = 256, flushBurst = 3, flushIntervalSeconds = 4 },
 	leaseWatchdog = { graceSeconds = 3 },
 	callbacks = {
-		onServerStop = __RLS_StopSeaHub,
-		onQuarantine = __RLS_StopSeaHub,
+		onServerStop = __RLS_EnforceServerStop,
+		onQuarantine = __RLS_EnforceSecurityKick,
 		onLeaseExpired = __RLS_StopSeaHub,
 		onStopped = __RLS_StopSeaHub,
 	},
