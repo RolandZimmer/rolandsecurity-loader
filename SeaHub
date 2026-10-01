@@ -3133,6 +3133,29 @@ local MAX_HTTP_RESPONSE_BYTES = 256 * 1024
 local DEFAULT_DETECTOR_VERSION = "roland-client-2026.10.1"
 local ABSENT_GLOBAL = {}
 local DIAGNOSTIC_CONFIRMATION = "ROLAND_STAGING_DIAGNOSTICS"
+-- VM artifacts are signed, but they still execute inside a hostile process.
+-- Keep malformed or accidentally oversized artifacts from consuming an entire
+-- executor tab before the protected runner can report the failure.
+local VM_MAX_CODE = 100000
+local VM_MAX_CONSTANT_PAGES = 4096
+local VM_MAX_CONSTANT_PAGE_BYTES = 16384
+local VM_MAX_CONSTANT_BYTES = 1024 * 1024
+local VM_MAX_CONSTANTS = 65535
+local VM_MAX_STACK = 8192
+local VM_MAX_STEPS = 1000000
+local VM_MAX_ARGUMENT = 2147483647
+local VM_OPERATION_SET = {
+	PUSH_CONST = true, GET_GLOBAL = true, GET_FIELD = true, CALL = true, POP = true, DUP = true,
+	GET_ARG = true, EQ = true, NE = true, LT = true, LTE = true, GT = true, GTE = true, NOT = true, NEG = true,
+	ADD = true, SUB = true, MUL = true, DIV = true, CONCAT = true, AND = true, OR = true,
+	JUMP = true, JUMP_IF_FALSE = true, RETURN = true, GET_LOCAL = true, SET_LOCAL = true, MAKE_TABLE = true,
+}
+local VM_REQUIRED_OPERATION_SET = {
+	PUSH_CONST = true, GET_GLOBAL = true, GET_FIELD = true, CALL = true, POP = true, DUP = true,
+	GET_ARG = true, EQ = true, NE = true, LT = true, LTE = true, GT = true, GTE = true, NOT = true, NEG = true,
+	ADD = true, SUB = true, MUL = true, DIV = true, CONCAT = true, AND = true, OR = true,
+	JUMP = true, JUMP_IF_FALSE = true, RETURN = true,
+}
 local TERMINAL_ERROR_CODES = {
 	SESSION_DENIED = true,
 	LICENSE_DENIED = true,
@@ -5197,6 +5220,12 @@ function RolandSecurity:runProtected(label, callback, ...)
 end
 
 function RolandSecurity:_decodeVmConstants(artifact)
+	local pages = artifact.constantPages
+	if type(pages) ~= "table" then return nil, "vm-pages-invalid" end
+	local pageCount = #pages
+	if pageCount < 1 or pageCount > VM_MAX_CONSTANT_PAGES then
+		return nil, "vm-pages-limit"
+	end
 	local mask = decodeBase64Url(artifact.keyMask)
 	local wrapped = decodeBase64Url(artifact.keyWrapped)
 	if type(mask) ~= "string" or #mask ~= 32 or type(wrapped) ~= "string" or #wrapped ~= 32 then
@@ -5205,15 +5234,26 @@ function RolandSecurity:_decodeVmConstants(artifact)
 	local key = xorStrings(mask, wrapped)
 	if key == nil then return nil, "vm-key-invalid" end
 	local decoded = {}
-	for index, page in ipairs(artifact.constantPages) do
+	local totalBytes = 0
+	for index, page in ipairs(pages) do
 		if type(page) ~= "table" or type(page.sha256) ~= "string" or #page.sha256 ~= 64 then
 			return nil, "vm-page-invalid"
 		end
-		local nonce = decodeBase64Url(page.nonce)
-		local encrypted = decodeBase64Url(page.bytes)
-		if type(nonce) ~= "string" or #nonce ~= 16 or type(encrypted) ~= "string" then
+		if page.sha256:match("^[0-9a-fA-F]+$") == nil then
 			return nil, "vm-page-invalid"
 		end
+		if type(page.bytes) ~= "string" or #page.bytes == 0
+			or #page.bytes > math.ceil(VM_MAX_CONSTANT_PAGE_BYTES / 3) * 4 then
+			return nil, "vm-page-limit"
+		end
+		local nonce = decodeBase64Url(page.nonce)
+		local encrypted = decodeBase64Url(page.bytes)
+		if type(nonce) ~= "string" or #nonce ~= 16 or type(encrypted) ~= "string"
+			or #encrypted == 0 or #encrypted > VM_MAX_CONSTANT_PAGE_BYTES then
+			return nil, "vm-page-invalid"
+		end
+		totalBytes = totalBytes + #encrypted
+		if totalBytes > VM_MAX_CONSTANT_BYTES then return nil, "vm-constants-limit" end
 		local plain = xorStrings(encrypted, vmStream(key, nonce, #encrypted))
 		if plain == nil or sha256(plain) ~= page.sha256:lower() then
 			return nil, "vm-page-digest-mismatch"
@@ -5227,6 +5267,21 @@ function RolandSecurity:_decodeVmConstants(artifact)
 	local ok, constants = pcall(self._adapters.jsonDecode, encoded)
 	encoded = nil
 	if not ok or type(constants) ~= "table" then return nil, "vm-constants-invalid" end
+	local constantCount = 0
+	for index, value in pairs(constants) do
+		if type(index) ~= "number" or index < 1 or index % 1 ~= 0 then
+			return nil, "vm-constants-invalid"
+		end
+		constantCount = math.max(constantCount, index)
+		local valueType = type(value)
+		if valueType ~= "string" and valueType ~= "number" and valueType ~= "boolean" and value ~= nil then
+			return nil, "vm-constant-type-invalid"
+		end
+		if valueType == "number" and (value ~= value or value == math.huge or value == -math.huge) then
+			return nil, "vm-constant-type-invalid"
+		end
+	end
+	if constantCount > VM_MAX_CONSTANTS then return nil, "vm-constants-limit" end
 	return constants
 end
 
@@ -5238,6 +5293,12 @@ function RolandSecurity:_runVmArtifact(artifact, ...)
 		or type(artifact.constantPages) ~= "table" then
 		return false, "vm-artifact-invalid"
 	end
+	local codeCount = #artifact.code
+	if codeCount < 1 or codeCount > VM_MAX_CODE then return false, "vm-code-limit" end
+	if type(artifact.entry) ~= "number" or artifact.entry ~= artifact.entry
+		or artifact.entry % 1 ~= 0 or artifact.entry < 0 or artifact.entry >= codeCount then
+		return false, "vm-entry-invalid"
+	end
 	if type(self._deliveryWatermark) ~= "string"
 		or self._deliveryWatermark:match("^RWM_[A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9]_[A-F0-9]+$") == nil
 		or #self._deliveryWatermark ~= 53 then
@@ -5246,17 +5307,46 @@ function RolandSecurity:_runVmArtifact(artifact, ...)
 	local constants, constantError = self:_decodeVmConstants(artifact)
 	if constants == nil then return false, constantError end
 	local inverse = {}
+	local opcodeCount = 0
 	for name, opcode in pairs(artifact.opcodeMap) do
-		if type(name) ~= "string" or type(opcode) ~= "number" or inverse[opcode] ~= nil then
+		if type(name) ~= "string" or not VM_OPERATION_SET[name] or type(opcode) ~= "number"
+			or opcode ~= opcode or opcode % 1 ~= 0 or opcode < 0 or opcode > 65535 or inverse[opcode] ~= nil then
 			return false, "vm-opcode-map-invalid"
 		end
 		inverse[opcode] = name
+		opcodeCount = opcodeCount + 1
+	end
+	if opcodeCount < 1 or type(artifact.opcodeMap.RETURN) ~= "number" then return false, "vm-opcode-map-invalid" end
+	for index = 1, codeCount do
+		local instruction = artifact.code[index]
+		if type(instruction) ~= "table" or type(instruction[1]) ~= "number"
+			or instruction[1] ~= instruction[1] or instruction[1] % 1 ~= 0
+			or instruction[1] < 0 or instruction[1] > 65535
+			or inverse[instruction[1]] == nil
+			or type(instruction[2]) ~= "number" or instruction[2] ~= instruction[2]
+			or instruction[2] % 1 ~= 0 or instruction[2] < -2147483648 or instruction[2] > VM_MAX_ARGUMENT then
+			return false, "vm-instruction-invalid"
+		end
+		local operation = inverse[instruction[1]]
+		if (operation == "JUMP" or operation == "JUMP_IF_FALSE")
+			and (instruction[2] < 0 or instruction[2] >= codeCount) then
+			return false, "vm-jump-invalid"
+		end
+		if operation == "CALL" and (instruction[2] < 0 or instruction[2] > 64) then
+			return false, "vm-call-invalid"
+		end
+		if operation == "RETURN" and (instruction[2] < 0 or instruction[2] > VM_MAX_STACK) then
+			return false, "vm-return-invalid"
+		end
 	end
 	local stack, stackTop = {}, 0
+	local locals, localSet = {}, {}
 	local supplied = table.pack(...)
-	local pc = math.floor(tonumber(artifact.entry) or 0) + 1
-	local steps, maximumSteps = 0, math.max(1024, #artifact.code * 128)
+	local constantCount = #constants
+	local pc = artifact.entry + 1
+	local steps, maximumSteps = 0, math.min(VM_MAX_STEPS, math.max(1024, codeCount * 128))
 	local function push(value)
+		if stackTop >= VM_MAX_STACK then error("vm-stack-limit", 0) end
 		stackTop = stackTop + 1
 		stack[stackTop] = value
 	end
@@ -5273,23 +5363,45 @@ function RolandSecurity:_runVmArtifact(artifact, ...)
 		local instruction = artifact.code[pc]
 		if type(instruction) ~= "table" then return false, "vm-pc-invalid" end
 		local operation = inverse[instruction[1]]
-		local argument = math.floor(tonumber(instruction[2]) or 0)
+		local argument = instruction[2]
 		pc = pc + 1
 		if operation == "PUSH_CONST" then
+			if argument < 0 or argument >= constantCount then return false, "vm-constant-index-invalid" end
 			push(constants[argument + 1])
 		elseif operation == "GET_ARG" then
 			if argument < 0 or argument >= supplied.n then return false, "vm-argument-invalid" end
 			push(supplied[argument + 1])
+		elseif operation == "GET_LOCAL" then
+			if argument < 0 or argument >= 64 or not localSet[argument + 1] then return false, "vm-local-invalid" end
+			push(locals[argument + 1])
+		elseif operation == "SET_LOCAL" then
+			if argument < 0 or argument >= 64 or stackTop < 1 then return false, "vm-local-invalid" end
+			locals[argument + 1] = pop()
+			localSet[argument + 1] = true
+		elseif operation == "MAKE_TABLE" then
+			if argument < 0 or argument > 64 or stackTop < argument * 2 then return false, "vm-table-invalid" end
+			local value = {}
+			for index = argument, 1, -1 do
+				local fieldValue, fieldName = pop(), pop()
+				if fieldName == nil or (type(fieldName) ~= "string" and type(fieldName) ~= "number") then
+					return false, "vm-table-key-invalid"
+				end
+				value[fieldName] = fieldValue
+			end
+			push(value)
 		elseif operation == "GET_GLOBAL" then
+			if argument < 0 or argument >= constantCount then return false, "vm-constant-index-invalid" end
 			local name = constants[argument + 1]
 			if type(name) ~= "string" then return false, "vm-global-name-invalid" end
 			local value = self._vmGlobals[name]
 			if value == nil then return false, "vm-global-denied" end
 			push(value)
 		elseif operation == "GET_FIELD" then
+			if argument < 0 or argument >= constantCount then return false, "vm-constant-index-invalid" end
 			local name = constants[argument + 1]
 			local object = pop()
 			if type(name) ~= "string" then return false, "vm-field-name-invalid" end
+			if type(object) ~= "table" then return false, "vm-field-object-denied" end
 			push(object[name])
 		elseif operation == "CALL" then
 			if argument < 0 or argument > 64 or stackTop < argument + 1 then return false, "vm-call-invalid" end
@@ -5297,7 +5409,10 @@ function RolandSecurity:_runVmArtifact(artifact, ...)
 			for index = argument, 1, -1 do callArguments[index] = pop() end
 			local callback = pop()
 			if type(callback) ~= "function" then return false, "vm-call-target-invalid" end
-			push(callback(table.unpack(callArguments, 1, argument)))
+			local callbackResult = table.pack(callback(table.unpack(callArguments, 1, argument)))
+			for index = 1, argument do callArguments[index] = nil end
+			push(callbackResult[1])
+			for index = 1, callbackResult.n do callbackResult[index] = nil end
 		elseif operation == "POP" then
 			pop()
 		elseif operation == "DUP" then
@@ -5311,34 +5426,49 @@ function RolandSecurity:_runVmArtifact(artifact, ...)
 			push(left ~= right)
 		elseif operation == "LT" then
 			local right, left = pop(), pop()
+			if (type(left) ~= "number" and type(left) ~= "string") or type(left) ~= type(right) then return false, "vm-compare-type-invalid" end
 			push(left < right)
 		elseif operation == "LTE" then
 			local right, left = pop(), pop()
+			if (type(left) ~= "number" and type(left) ~= "string") or type(left) ~= type(right) then return false, "vm-compare-type-invalid" end
 			push(left <= right)
 		elseif operation == "GT" then
 			local right, left = pop(), pop()
+			if (type(left) ~= "number" and type(left) ~= "string") or type(left) ~= type(right) then return false, "vm-compare-type-invalid" end
 			push(left > right)
 		elseif operation == "GTE" then
 			local right, left = pop(), pop()
+			if (type(left) ~= "number" and type(left) ~= "string") or type(left) ~= type(right) then return false, "vm-compare-type-invalid" end
 			push(left >= right)
 		elseif operation == "NOT" then
 			push(not pop())
 		elseif operation == "NEG" then
-			push(-pop())
+			local value = pop()
+			if type(value) ~= "number" then return false, "vm-number-required" end
+			push(-value)
 		elseif operation == "ADD" then
 			local right, left = pop(), pop()
+			if type(left) ~= "number" or type(right) ~= "number" then return false, "vm-number-required" end
 			push(left + right)
 		elseif operation == "SUB" then
 			local right, left = pop(), pop()
+			if type(left) ~= "number" or type(right) ~= "number" then return false, "vm-number-required" end
 			push(left - right)
 		elseif operation == "MUL" then
 			local right, left = pop(), pop()
+			if type(left) ~= "number" or type(right) ~= "number" then return false, "vm-number-required" end
 			push(left * right)
 		elseif operation == "DIV" then
 			local right, left = pop(), pop()
+			if type(left) ~= "number" or type(right) ~= "number" or right == 0 then return false, "vm-number-required" end
 			push(left / right)
 		elseif operation == "CONCAT" then
 			local right, left = pop(), pop()
+			local leftType, rightType = type(left), type(right)
+			if (leftType ~= "string" and leftType ~= "number" and leftType ~= "boolean")
+				or (rightType ~= "string" and rightType ~= "number" and rightType ~= "boolean") then
+				return false, "vm-concat-type-invalid"
+			end
 			push(tostring(left) .. tostring(right))
 		elseif operation == "AND" then
 			local right, left = pop(), pop()
@@ -5355,6 +5485,7 @@ function RolandSecurity:_runVmArtifact(artifact, ...)
 			local results = table.create(argument)
 			for index = argument, 1, -1 do results[index] = pop() end
 			for index = 1, #constants do constants[index] = nil end
+			for index = 1, #locals do locals[index] = nil end
 			return true, table.unpack(results, 1, argument)
 		else
 			return false, "vm-opcode-invalid"
