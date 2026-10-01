@@ -3159,6 +3159,7 @@ local SIGNALS = {
 	L11_HTTP_CHANNEL_HOOKED = { severity = "HIGH", confidence = 75, score = 56, family = "TRANSPORT", decisive = true },
 	L12_PAYLOAD_COMPILATION_FAILED = { severity = "MEDIUM", confidence = 45, score = 20, family = "OPERATIONAL", decisive = false },
 	L13_RUNTIME_EXECUTION_FAILED = { severity = "MEDIUM", confidence = 40, score = 16, family = "OPERATIONAL", decisive = false },
+	RLS_TAMPER_ENFORCED = { severity = "CRITICAL", confidence = 100, score = 0, family = "ENFORCEMENT", decisive = false },
 }
 
 local SEVERITY_RANK = { LOW = 1, MEDIUM = 2, HIGH = 3, CRITICAL = 4 }
@@ -4354,6 +4355,14 @@ function RolandSecurity:_quarantine(reason)
 	self._quarantined = true
 	self._quarantineReason = reason
 	self._state = "QUARANTINED"
+	if reason == "local-correlation" then
+		local queued = self:reportSignal("RLS_TAMPER_ENFORCED", { reason = reason }, { confidence = 100 })
+		if queued then
+			local enforcement = table.remove(self._eventQueue)
+			if enforcement then table.insert(self._eventQueue, 1, enforcement) end
+			self:flushEvents(1, true)
+		end
+	end
 	if not alreadyRecorded then
 		self:_notify("onQuarantine", reason)
 	end
@@ -4444,11 +4453,11 @@ function RolandSecurity:reportSignal(signalCode, metadata, overrides)
 	return queued, queued and event.body.eventId or "queue-full"
 end
 
-function RolandSecurity:flushEvents(maximum)
+function RolandSecurity:flushEvents(maximum, force)
 	if self._state ~= "ACTIVE" and self._state ~= "QUARANTINED" then
 		return 0
 	end
-	if self._adapters.clock() >= self._heartbeatDueAt - 2 then
+	if force ~= true and self._adapters.clock() >= self._heartbeatDueAt - 2 then
 		return 0
 	end
 	maximum = clamp(tonumber(maximum) or tonumber(self._queueConfig.flushBurst) or 3, 1, 10)
