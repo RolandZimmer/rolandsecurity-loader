@@ -4346,8 +4346,9 @@ function RolandSecurity:_answerRuntimeChallenge(sequence)
 	local results = {}
 	for index, probeId in ipairs(challenge.probes) do
 		local probe = probes[probeId]
+		local chainBefore = self._chainIndex
 		local ok = type(probe) == "function" and pcall(probe, self)
-		local status = ok and "PASS" or "ERROR"
+		local status = not ok and "ERROR" or self._chainIndex > chainBefore and "FAIL" or "PASS"
 		results[index] = {
 			id = probeId,
 			status = status,
