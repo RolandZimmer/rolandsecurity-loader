@@ -3267,6 +3267,54 @@ local function sha256(message)
 	return string.format("%08x%08x%08x%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4, h5, h6, h7)
 end
 
+local BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+local function decodeBase64Url(value)
+	if type(value) ~= "string" or value:match("^[%w_-]*$") == nil or #value % 4 == 1 then return nil end
+	local output = {}
+	local accumulator, bits = 0, 0
+	for index = 1, #value do
+		local position = BASE64URL_ALPHABET:find(value:sub(index, index), 1, true)
+		if position == nil then return nil end
+		accumulator = accumulator * 64 + position - 1
+		bits = bits + 6
+		if bits >= 8 then
+			bits = bits - 8
+			table.insert(output, string.char(math.floor(accumulator / (2 ^ bits)) % 256))
+			accumulator = accumulator % (2 ^ bits)
+		end
+	end
+	if bits > 0 and accumulator ~= 0 then return nil end
+	return table.concat(output)
+end
+
+local function xorStrings(left, right)
+	if type(left) ~= "string" or type(right) ~= "string" or #left ~= #right then return nil end
+	local output = table.create(#left)
+	for index = 1, #left do
+		output[index] = string.char(bit32.bxor(string.byte(left, index), string.byte(right, index)))
+	end
+	return table.concat(output)
+end
+
+local function vmStream(key, nonce, length)
+	local output = {}
+	local produced, counter = 0, 0
+	while produced < length do
+		local digest = sha256("roland-vm-page-v1\0" .. key .. nonce .. tostring(counter))
+		local block = {}
+		for index = 1, #digest, 2 do
+			block[#block + 1] = string.char(tonumber(digest:sub(index, index + 1), 16))
+		end
+		local bytes = table.concat(block)
+		local take = math.min(#bytes, length - produced)
+		output[#output + 1] = bytes:sub(1, take)
+		produced = produced + take
+		counter = counter + 1
+	end
+	return table.concat(output)
+end
+
 local function jsonEscape(value)
 	local substitutions = {
 		['"'] = '\\"',
@@ -3822,8 +3870,11 @@ function RolandSecurity.new(config)
 	self._sessionId = nil
 	self._sessionToken = nil
 	self._payloadTicket = nil
+	self._deliveryWatermark = nil
 	self._authorizedBuildId = nil
 	self._authorizedBuild = nil
+	self._vmGlobals = config.vmGlobals or {}
+	assert(type(self._vmGlobals) == "table", "vmGlobals must be a table")
 	self._resumeToken = config.resumeToken
 	self._clientInstanceId = self._detectorConfig.clientInstanceId or self._adapters.uuid()
 	self._activationId = self._activationConfig.activationId or self._adapters.uuid()
@@ -5073,6 +5124,148 @@ function RolandSecurity:runProtected(label, callback, ...)
 	return true, table.unpack(results, 2, results.n)
 end
 
+function RolandSecurity:_decodeVmConstants(artifact)
+	local mask = decodeBase64Url(artifact.keyMask)
+	local wrapped = decodeBase64Url(artifact.keyWrapped)
+	if type(mask) ~= "string" or #mask ~= 32 or type(wrapped) ~= "string" or #wrapped ~= 32 then
+		return nil, "vm-key-invalid"
+	end
+	local key = xorStrings(mask, wrapped)
+	if key == nil then return nil, "vm-key-invalid" end
+	local decoded = {}
+	for index, page in ipairs(artifact.constantPages) do
+		if type(page) ~= "table" or type(page.sha256) ~= "string" or #page.sha256 ~= 64 then
+			return nil, "vm-page-invalid"
+		end
+		local nonce = decodeBase64Url(page.nonce)
+		local encrypted = decodeBase64Url(page.bytes)
+		if type(nonce) ~= "string" or #nonce ~= 16 or type(encrypted) ~= "string" then
+			return nil, "vm-page-invalid"
+		end
+		local plain = xorStrings(encrypted, vmStream(key, nonce, #encrypted))
+		if plain == nil or sha256(plain) ~= page.sha256:lower() then
+			return nil, "vm-page-digest-mismatch"
+		end
+		decoded[index] = plain
+		artifact.constantPages[index] = false
+	end
+	key, mask, wrapped = nil, nil, nil
+	local encoded = table.concat(decoded)
+	for index = 1, #decoded do decoded[index] = nil end
+	local ok, constants = pcall(self._adapters.jsonDecode, encoded)
+	encoded = nil
+	if not ok or type(constants) ~= "table" then return nil, "vm-constants-invalid" end
+	return constants
+end
+
+function RolandSecurity:_runVmArtifact(artifact, ...)
+	if type(artifact) ~= "table" or artifact.format ~= "RLSVM1"
+		or artifact.buildId ~= self._authorizedBuildId
+		or type(artifact.opcodeMap) ~= "table"
+		or type(artifact.code) ~= "table"
+		or type(artifact.constantPages) ~= "table" then
+		return false, "vm-artifact-invalid"
+	end
+	if type(self._deliveryWatermark) ~= "string"
+		or self._deliveryWatermark:match("^RWM_[A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9]_[A-F0-9]+$") == nil
+		or #self._deliveryWatermark ~= 53 then
+		return false, "vm-watermark-invalid"
+	end
+	local constants, constantError = self:_decodeVmConstants(artifact)
+	if constants == nil then return false, constantError end
+	local inverse = {}
+	for name, opcode in pairs(artifact.opcodeMap) do
+		if type(name) ~= "string" or type(opcode) ~= "number" or inverse[opcode] ~= nil then
+			return false, "vm-opcode-map-invalid"
+		end
+		inverse[opcode] = name
+	end
+	local stack, stackTop = {}, 0
+	local supplied = table.pack(...)
+	local pc = math.floor(tonumber(artifact.entry) or 0) + 1
+	local steps, maximumSteps = 0, math.max(1024, #artifact.code * 128)
+	local function push(value)
+		stackTop = stackTop + 1
+		stack[stackTop] = value
+	end
+	local function pop()
+		if stackTop < 1 then error("vm-stack-underflow", 0) end
+		local value = stack[stackTop]
+		stack[stackTop] = nil
+		stackTop = stackTop - 1
+		return value
+	end
+	while true do
+		steps = steps + 1
+		if steps > maximumSteps then return false, "vm-step-limit" end
+		local instruction = artifact.code[pc]
+		if type(instruction) ~= "table" then return false, "vm-pc-invalid" end
+		local operation = inverse[instruction[1]]
+		local argument = math.floor(tonumber(instruction[2]) or 0)
+		pc = pc + 1
+		if operation == "PUSH_CONST" then
+			push(constants[argument + 1])
+		elseif operation == "GET_GLOBAL" then
+			local name = constants[argument + 1]
+			if type(name) ~= "string" then return false, "vm-global-name-invalid" end
+			local value = self._vmGlobals[name]
+			if value == nil then return false, "vm-global-denied" end
+			push(value)
+		elseif operation == "GET_FIELD" then
+			local name = constants[argument + 1]
+			local object = pop()
+			if type(name) ~= "string" then return false, "vm-field-name-invalid" end
+			push(object[name])
+		elseif operation == "CALL" then
+			if argument < 0 or argument > 64 or stackTop < argument + 1 then return false, "vm-call-invalid" end
+			local callArguments = table.create(argument)
+			for index = argument, 1, -1 do callArguments[index] = pop() end
+			local callback = pop()
+			if type(callback) ~= "function" then return false, "vm-call-target-invalid" end
+			push(callback(table.unpack(callArguments, 1, argument)))
+		elseif operation == "POP" then
+			pop()
+		elseif operation == "DUP" then
+			if stackTop < 1 then return false, "vm-stack-underflow" end
+			push(stack[stackTop])
+		elseif operation == "EQ" then
+			local right, left = pop(), pop()
+			push(left == right)
+		elseif operation == "ADD" then
+			local right, left = pop(), pop()
+			push(left + right)
+		elseif operation == "CONCAT" then
+			local right, left = pop(), pop()
+			push(tostring(left) .. tostring(right))
+		elseif operation == "JUMP" then
+			pc = argument + 1
+		elseif operation == "JUMP_IF_FALSE" then
+			if not pop() then pc = argument + 1 end
+		elseif operation == "RETURN" then
+			if argument < 0 or argument > stackTop then return false, "vm-return-invalid" end
+			local results = table.create(argument)
+			for index = argument, 1, -1 do results[index] = pop() end
+			for index = 1, #constants do constants[index] = nil end
+			return true, table.unpack(results, 1, argument)
+		else
+			return false, "vm-opcode-invalid"
+		end
+	end
+end
+
+function RolandSecurity:executeVmPayload(source, envelope, ...)
+	local verified, verifyError = self:verifyPayload(source, envelope)
+	if not verified then return false, verifyError end
+	if source:sub(1, 7) ~= "RLSVM1\n" then return false, "vm-magic-invalid" end
+	local decodeOk, artifact = pcall(self._adapters.jsonDecode, source:sub(8))
+	if not decodeOk then return false, "vm-envelope-invalid" end
+	return self:runProtected("roland-vm", function(...)
+		local ok, first, second, third = self:_runVmArtifact(artifact, ...)
+		if not ok then error(first, 0) end
+		return first, second, third
+	end, ...)
+end
+
 function RolandSecurity:executePayload(source, envelope, chunkName, ...)
 	local verified, verifyError = self:verifyPayload(source, envelope)
 	if not verified then
@@ -5123,6 +5316,7 @@ function RolandSecurity:downloadAuthorizedPayload()
 	local responseBuildId = headerValue(responseHeaders, "x-roland-build-id")
 	local responseVersion = headerValue(responseHeaders, "x-roland-build-version")
 	local responseDigest = headerValue(responseHeaders, "x-roland-payload-sha256")
+	local deliveryWatermark = headerValue(responseHeaders, "x-roland-delivery-watermark")
 	local contentType = headerValue(responseHeaders, "content-type")
 	if responseBuildId ~= manifest.buildId
 		or responseVersion ~= manifest.version
@@ -5141,6 +5335,7 @@ function RolandSecurity:downloadAuthorizedPayload()
 	if not verified then
 		return false, verifyResult
 	end
+	self._deliveryWatermark = deliveryWatermark
 	return true, source, verifyResult
 end
 
@@ -5148,6 +5343,9 @@ function RolandSecurity:downloadAndExecuteAuthorizedPayload(chunkName, ...)
 	local downloaded, sourceOrError = self:downloadAuthorizedPayload()
 	if not downloaded then
 		return false, sourceOrError
+	end
+	if sourceOrError:sub(1, 7) == "RLSVM1\n" then
+		return self:executeVmPayload(sourceOrError, self._authorizedBuild, ...)
 	end
 	local compiled, compileError = self:compileProtected(sourceOrError, chunkName)
 	if not compiled then
