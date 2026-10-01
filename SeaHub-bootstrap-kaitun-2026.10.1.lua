@@ -3440,6 +3440,25 @@ local function hasValidLeaseTiming(data)
 		and isIntegerInRange(data.heartbeatAfterSeconds, 10, 125)
 end
 
+local CHALLENGE_PROBES = {
+	GAME = true, SERVICES = true, SCHEDULER = true, EXECUTOR = true,
+	DEBUG = true, COMPILER = true, TRANSPORT = true, CONTINUITY = true,
+}
+
+local function hasValidChallenge(challenge, expectedSequence)
+	if type(challenge) ~= "table"
+		or challenge.sequence ~= expectedSequence
+		or type(challenge.nonce) ~= "string" or #challenge.nonce ~= 43
+		or challenge.nonce:match("^[%w_-]+$") == nil
+		or not isIntegerInRange(challenge.expiresInSeconds, 10, 90)
+		or type(challenge.probes) ~= "table" or #challenge.probes ~= 2 then
+		return false
+	end
+	return CHALLENGE_PROBES[challenge.probes[1]] == true
+		and CHALLENGE_PROBES[challenge.probes[2]] == true
+		and challenge.probes[1] ~= challenge.probes[2]
+end
+
 local function hasValidEventDecision(data)
 	return type(data) == "table" and (
 		(data.decision == "OBSERVE" and data.action == "NONE")
@@ -3887,6 +3906,8 @@ function RolandSecurity.new(config)
 		"activationId must be a UUID")
 	self._activationId = self._activationId:lower()
 	self._heartbeatSequence = nil
+	self._challenge = nil
+	self._capabilityDeadlineAt = math.huge
 	self._heartbeatAfter = 24
 	self._heartbeatDueAt = math.huge
 	self._leaseDeadlineAt = math.huge
@@ -4197,6 +4218,14 @@ function RolandSecurity:activate()
 	self._authorizedBuildId = data.buildId or self._payloadPolicy.buildId
 	self._authorizedBuild = authorizedBuild
 	self._heartbeatSequence = data.nextHeartbeatSequence
+	if data.challenge ~= nil then
+		if not hasValidChallenge(data.challenge, data.nextHeartbeatSequence)
+			or not isIntegerInRange(data.capabilityLeaseRemainingSeconds, 10, 90) then
+			return self:_rejectAcceptedActivation(data, status, "INVALID_RUNTIME_CHALLENGE")
+		end
+		self._challenge = data.challenge
+		self._capabilityDeadlineAt = self._adapters.clock() + data.capabilityLeaseRemainingSeconds
+	end
 	self._heartbeatAfter = clamp(tonumber(data.heartbeatAfterSeconds) or 24, 10, 125)
 	self._heartbeatDueAt = self._adapters.clock() + self._heartbeatAfter
 	self:_updateLease(data, false)
@@ -4301,17 +4330,55 @@ function RolandSecurity:_checkLeaseWatchdog()
 	return false
 end
 
+function RolandSecurity:_answerRuntimeChallenge(sequence)
+	local challenge = self._challenge
+	if not hasValidChallenge(challenge, sequence) then return nil end
+	local probes = {
+		GAME = self._checkGameObjectCoherence,
+		SERVICES = self._checkServiceCoherence,
+		SCHEDULER = self._checkTaskSchedulerCoherence,
+		EXECUTOR = self._checkExecutorSurfaceCoherence,
+		DEBUG = self._checkDebugSurfaceCoherence,
+		COMPILER = self._checkLoadstringHook,
+		TRANSPORT = self._checkHttpChannel,
+		CONTINUITY = self._checkRuntimeContinuity,
+	}
+	local results = {}
+	for index, probeId in ipairs(challenge.probes) do
+		local probe = probes[probeId]
+		local ok = type(probe) == "function" and pcall(probe, self)
+		local status = ok and "PASS" or "ERROR"
+		results[index] = {
+			id = probeId,
+			status = status,
+			digest = sha256(challenge.nonce .. "\0" .. probeId .. "\0" .. status),
+		}
+	end
+	return { sequence = sequence, nonce = challenge.nonce, results = results }
+end
+
 function RolandSecurity:heartbeatOnce()
 	if (self._state ~= "ACTIVE" and self._state ~= "QUARANTINED") or not self._heartbeatSequence then
 		return false, "not-active"
 	end
 	local sequence = self._heartbeatSequence
-	local status, data, transportError, responseHeaders = self:_post("/v1/runtime/heartbeat", { sequence = sequence }, true)
+	local challengeResponse = self:_answerRuntimeChallenge(sequence)
+	local heartbeatBody = { sequence = sequence }
+	if challengeResponse ~= nil then heartbeatBody.challengeResponse = challengeResponse end
+	local status, data, transportError, responseHeaders = self:_post("/v1/runtime/heartbeat", heartbeatBody, true)
 	if status == 200 and type(data) == "table"
 		and data.sessionId == self._sessionId
 		and isIntegerInRange(data.nextHeartbeatSequence, 1, 2147483647)
 		and data.nextHeartbeatSequence == sequence + 1
 		and hasValidLeaseTiming(data) then
+		if self._challenge ~= nil or data.challenge ~= nil then
+			if not hasValidChallenge(data.challenge, data.nextHeartbeatSequence)
+				or not isIntegerInRange(data.capabilityLeaseRemainingSeconds, 10, 90) then
+				return false, "invalid-runtime-challenge"
+			end
+			self._challenge = data.challenge
+			self._capabilityDeadlineAt = self._adapters.clock() + data.capabilityLeaseRemainingSeconds
+		end
 		self._heartbeatSequence = data.nextHeartbeatSequence
 		self._heartbeatAfter = data.heartbeatAfterSeconds
 		self._heartbeatDueAt = self._adapters.clock() + self._heartbeatAfter
@@ -5106,6 +5173,10 @@ function RolandSecurity:runProtected(label, callback, ...)
 	self:_checkLeaseWatchdog()
 	if self._state ~= "ACTIVE" then
 		return false, self._state == "QUARANTINED" and "quarantined" or "not-active"
+	end
+	if self._adapters.clock() >= self._capabilityDeadlineAt then
+		self:_notify("onCapabilityLeaseExpired")
+		return false, "capability-lease-expired"
 	end
 	self._protectedPayloadStarted = true
 	local arguments = table.pack(...)
