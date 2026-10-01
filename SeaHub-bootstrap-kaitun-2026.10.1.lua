@@ -3782,7 +3782,7 @@ function RolandSecurity.new(config)
 	self._detectorVersion = (config.detectorVersion or DEFAULT_DETECTOR_VERSION):sub(1, 64)
 	self._mode = config.mode == "quarantine" and "quarantine" or "observe"
 	self._manualScheduling = config.manualScheduling == true
-	for _, name in ipairs({ "callbacks", "detectors", "payloadPolicy", "quarantine", "queue", "activation", "leaseWatchdog" }) do
+	for _, name in ipairs({ "callbacks", "detectors", "payloadPolicy", "quarantine", "queue", "activation", "shutdown", "leaseWatchdog" }) do
 		assert(config[name] == nil or type(config[name]) == "table", name .. " must be a table")
 	end
 	self._callbacks = config.callbacks or {}
@@ -3791,6 +3791,7 @@ function RolandSecurity.new(config)
 	self._quarantineConfig = config.quarantine or {}
 	self._queueConfig = config.queue or {}
 	self._activationConfig = config.activation or {}
+	self._shutdownConfig = config.shutdown or {}
 	self._leaseConfig = config.leaseWatchdog or {}
 	self._diagnosticEnabled = config.deployment == "staging"
 		and type(config.diagnostics) == "table"
@@ -3819,6 +3820,7 @@ function RolandSecurity.new(config)
 	self._leaseDeadlineAt = math.huge
 	self._requestBusy = false
 	self._stopping = false
+	self._stopBusy = false
 	self._eventQueue = {}
 	self._sentAt = {}
 	self._dedupUntil = {}
@@ -3883,7 +3885,15 @@ function RolandSecurity:_post(path, body, authenticated)
 		end
 		headers.Authorization = "Bearer " .. self._sessionToken
 	end
-	local encodeOk, encoded = pcall(self._adapters.jsonEncode, body)
+	local encodeOk, encoded = true, nil
+	-- Roblox HttpService serializes an empty Lua table as [] because Luau has
+	-- no distinct object type. Runtime endpoints expecting an empty JSON object
+	-- must receive the canonical literal instead.
+	if type(body) == "table" and next(body) == nil then
+		encoded = "{}"
+	else
+		encodeOk, encoded = pcall(self._adapters.jsonEncode, body)
+	end
 	if not encodeOk then
 		self._requestBusy = false
 		return 0, nil, "encode-failed"
@@ -5056,16 +5066,44 @@ function RolandSecurity:stop(reason)
 	if self._state == "STOPPED" then
 		return true
 	end
-	self._stopping = true
+	if self._stopBusy then
+		return false
+	end
+	self._stopBusy = true
 	local tokenWasPresent = self._sessionToken ~= nil
 	local status = 0
+	local data, transportError, responseHeaders = nil, nil, nil
 	if tokenWasPresent and (self._state == "ACTIVE" or self._state == "QUARANTINED") then
-		status = select(1, self:_post("/v1/runtime/deactivate", {}, true))
+		local maximumAttempts = clamp(math.floor(tonumber(self._shutdownConfig.maxAttempts) or 3), 1, 5)
+		for attempt = 1, maximumAttempts do
+			status, data, transportError, responseHeaders = self:_post("/v1/runtime/deactivate", {}, true)
+			local accepted = status == 200 and type(data) == "table"
+				and data.deactivated == true and data.sessionId == self._sessionId
+			if accepted then break end
+			local retryable = status == 0 or status == 200 or status == 429 or status >= 500
+			if not retryable or attempt == maximumAttempts then break end
+			local baseDelay = clamp(tonumber(self._shutdownConfig.retryBaseSeconds) or 0.25, 0.05, 2)
+			local maximumDelay = clamp(tonumber(self._shutdownConfig.maxRetrySeconds) or 2, 0.25, 5)
+			local delay = status == 429 and retryAfterSeconds(responseHeaders, maximumDelay)
+				or math.min(maximumDelay, baseDelay * (2 ^ (attempt - 1)))
+			self._adapters.wait(delay)
+		end
 	end
+	local stopped = (status == 200 and type(data) == "table"
+		and data.deactivated == true and data.sessionId == self._sessionId) or not tokenWasPresent
+	if not stopped then
+		self._lastErrorCode = responseErrorCode(data) or transportError
+			or (status == 200 and "INVALID_DEACTIVATION_RESPONSE" or "DEACTIVATION_FAILED")
+		self._stopBusy = false
+		self:_notify("onStopFailed", self._lastErrorCode, status)
+		return false
+	end
+	self._stopping = true
 	self._sessionToken = nil
 	self._state = "STOPPED"
+	self._stopBusy = false
 	self:_notify("onStopped", safeString(reason or "client-stop", "client-stop"):sub(1, 128), status)
-	return status == 200 or not tokenWasPresent
+	return true
 end
 
 function RolandSecurity:getStatus()
@@ -5143,7 +5181,10 @@ end
 
 local previousRuntime = rawget(__RLS_Environment, "__ROLAND_SECURITY_RUNTIME")
 if type(previousRuntime) == "table" and type(previousRuntime.stop) == "function" then
-	pcall(previousRuntime.stop, previousRuntime, "bootstrap-replaced")
+	local stopCallOk, stopped = pcall(previousRuntime.stop, previousRuntime, "bootstrap-replaced")
+	if not stopCallOk or stopped ~= true then
+		error("Roland Security could not close the previous session; the existing runtime was preserved", 0)
+	end
 end
 
 local runtime = RolandSecurity.new({
@@ -5163,6 +5204,7 @@ local runtime = RolandSecurity.new({
 		verifyPayloadSignature = __RLS_VerifyPayloadSignature,
 	},
 	activation = { startupJitterSeconds = 3, maxAttempts = 3, retryBaseSeconds = 0.25 },
+	shutdown = { maxAttempts = 3, retryBaseSeconds = 0.25, maxRetrySeconds = 2 },
 	queue = { maxQueuedEvents = 48, maxEventsPerMinute = 60, dedupSeconds = 60, maxDedupEntries = 256, flushBurst = 3, flushIntervalSeconds = 4 },
 	leaseWatchdog = { graceSeconds = 3 },
 	callbacks = {
