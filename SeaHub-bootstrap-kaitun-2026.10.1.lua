@@ -3121,10 +3121,9 @@ local RolandSecurity = (function()
 --!strict
 -- Roland Security runtime client.
 --
--- This module intentionally keeps every client detector advisory. A hostile
--- executor controls this process, so license state and punitive decisions stay
--- on the server. Client observations can pause the protected payload locally,
--- but never call an administrative blacklist endpoint.
+-- A hostile executor controls this process, so the client never calls an
+-- administrative endpoint. It can stop locally and submit ordered evidence;
+-- only the server correlates independent families and commits license state.
 
 local RolandSecurity = {}
 RolandSecurity.__index = RolandSecurity
@@ -3159,6 +3158,13 @@ local SIGNALS = {
 	L11_HTTP_CHANNEL_HOOKED = { severity = "HIGH", confidence = 75, score = 56, family = "TRANSPORT", decisive = true },
 	L12_PAYLOAD_COMPILATION_FAILED = { severity = "MEDIUM", confidence = 45, score = 20, family = "OPERATIONAL", decisive = false },
 	L13_RUNTIME_EXECUTION_FAILED = { severity = "MEDIUM", confidence = 40, score = 16, family = "OPERATIONAL", decisive = false },
+	L14_GAME_OBJECT_INVALID = { severity = "HIGH", confidence = 80, score = 58, family = "EMULATION_GAME", decisive = true },
+	L15_SERVICE_COHERENCE_FAILED = { severity = "HIGH", confidence = 80, score = 58, family = "EMULATION_SERVICES", decisive = true },
+	L16_TASK_SCHEDULER_INVALID = { severity = "HIGH", confidence = 75, score = 52, family = "EMULATION_SCHEDULER", decisive = true },
+	L17_EXECUTOR_SURFACE_INCOHERENT = { severity = "HIGH", confidence = 75, score = 52, family = "EMULATION_EXECUTOR", decisive = true },
+	L18_DEBUG_SURFACE_INCOHERENT = { severity = "HIGH", confidence = 70, score = 48, family = "EMULATION_DEBUG", decisive = true },
+	L19_PAYLOAD_TICKET_INVALID = { severity = "HIGH", confidence = 90, score = 72, family = "DELIVERY", decisive = true },
+	L20_RUNTIME_CONTINUITY_BROKEN = { severity = "HIGH", confidence = 85, score = 64, family = "CONTINUITY", decisive = true },
 	RLS_TAMPER_ENFORCED = { severity = "CRITICAL", confidence = 100, score = 0, family = "ENFORCEMENT", decisive = false },
 }
 
@@ -3368,6 +3374,18 @@ local function isSessionTokenForId(token, sessionId)
 		and secret:match("^[%w_%-]+$") ~= nil
 end
 
+local function isPayloadTicketForId(ticket, sessionId)
+	if type(ticket) ~= "string" or not isUuid(sessionId) or #ticket ~= 84 then
+		return false
+	end
+	local ticketSessionId, secret = ticket:match("^RPT_([^_]+)_([%w_%-]+)$")
+	return ticketSessionId ~= nil
+		and ticketSessionId:lower() == sessionId:lower()
+		and type(secret) == "string"
+		and #secret == 43
+		and secret:match("^[%w_%-]+$") ~= nil
+end
+
 local function hasValidLeaseTiming(data)
 	return type(data) == "table"
 		and isIntegerInRange(data.leaseRemainingSeconds, 1, 300)
@@ -3378,6 +3396,7 @@ local function hasValidEventDecision(data)
 	return type(data) == "table" and (
 		(data.decision == "OBSERVE" and data.action == "NONE")
 		or (data.decision == "QUARANTINE" and data.action == "DEVICE_TEMPORARILY_QUARANTINED")
+		or (data.decision == "BLACKLIST" and data.action == "BLACKLIST")
 	)
 end
 
@@ -3802,6 +3821,7 @@ function RolandSecurity.new(config)
 	self._state = "CREATED"
 	self._sessionId = nil
 	self._sessionToken = nil
+	self._payloadTicket = nil
 	self._authorizedBuildId = nil
 	self._authorizedBuild = nil
 	self._resumeToken = config.resumeToken
@@ -3916,9 +3936,9 @@ function RolandSecurity:_getPayload(path)
 	if not self:_acquireRequestLock(5) then
 		return 0, nil, nil, "client-request-busy", nil
 	end
-	if not self._sessionToken then
+	if not self._sessionToken or not self._payloadTicket then
 		self._requestBusy = false
-		return 0, nil, nil, "missing-session", nil
+		return 0, nil, nil, "missing-payload-authorization", nil
 	end
 	local maximumBytes = clamp(
 		math.floor(tonumber(self._payloadPolicy.maximumBytes) or 1048576),
@@ -3931,8 +3951,10 @@ function RolandSecurity:_getPayload(path)
 		Headers = {
 			Accept = "text/plain",
 			Authorization = "Bearer " .. self._sessionToken,
+			["X-Roland-Payload-Ticket"] = self._payloadTicket,
 		},
 	})
+	self._payloadTicket = nil
 	self._requestBusy = false
 	if not requestOk then
 		return 0, nil, nil, "network-failed", nil
@@ -4080,6 +4102,7 @@ function RolandSecurity:activate()
 			and type(data) == "table"
 			and data.activationId == self._activationId
 			and isSessionTokenForId(data.sessionToken, data.sessionId)
+			and isPayloadTicketForId(data.payloadTicket, data.sessionId)
 			and isIntegerInRange(data.nextHeartbeatSequence, 1, 2147483647)
 			and (resumedActivation or data.nextHeartbeatSequence == 1)
 			and hasValidLeaseTiming(data)
@@ -4106,6 +4129,7 @@ function RolandSecurity:activate()
 	end
 	if type(data) ~= "table" or data.activationId ~= self._activationId
 		or not isSessionTokenForId(data.sessionToken, data.sessionId)
+		or not isPayloadTicketForId(data.payloadTicket, data.sessionId)
 		or not isIntegerInRange(data.nextHeartbeatSequence, 1, 2147483647)
 		or (not resumedActivation and data.nextHeartbeatSequence ~= 1)
 		or not hasValidLeaseTiming(data) then
@@ -4118,6 +4142,7 @@ function RolandSecurity:activate()
 
 	self._sessionId = data.sessionId
 	self._sessionToken = data.sessionToken
+	self._payloadTicket = data.payloadTicket
 	self._authorizedBuildId = data.buildId or self._payloadPolicy.buildId
 	self._authorizedBuild = authorizedBuild
 	self._heartbeatSequence = data.nextHeartbeatSequence
@@ -4143,6 +4168,7 @@ function RolandSecurity:_handleTerminal(code, status)
 	self._state = "DENIED"
 	self._stopping = true
 	self._sessionToken = nil
+	self._payloadTicket = nil
 	self:_notify("onServerStop", self._lastErrorCode, status)
 end
 
@@ -4358,9 +4384,9 @@ function RolandSecurity:_quarantine(reason)
 	if reason == "local-correlation" then
 		local queued = self:reportSignal("RLS_TAMPER_ENFORCED", { reason = reason }, { confidence = 100 })
 		if queued then
-			local enforcement = table.remove(self._eventQueue)
-			if enforcement then table.insert(self._eventQueue, 1, enforcement) end
-			self:flushEvents(1, true)
+			-- Preserve detector order so the server can verify at least two
+			-- independent evidence families before accepting permanent action.
+			self:flushEvents(10, true)
 		end
 	end
 	if not alreadyRecorded then
@@ -4682,7 +4708,7 @@ function RolandSecurity:injectAllDiagnosticVectors()
 		return false, "diagnostics-disabled"
 	end
 	local queued = 0
-	for index = 1, 13 do
+	for index = 1, 20 do
 		local signalCode = string.format("L%02d_", index)
 		for knownCode in pairs(SIGNALS) do
 			if knownCode:sub(1, 4) == signalCode then
@@ -4692,7 +4718,7 @@ function RolandSecurity:injectAllDiagnosticVectors()
 			end
 		end
 	end
-	return queued == 13, queued
+	return queued == 20, queued
 end
 
 function RolandSecurity:_checkLoadstringUpvalues()
@@ -4809,6 +4835,89 @@ function RolandSecurity:_checkHttpChannel()
 	end
 end
 
+function RolandSecurity:_checkGameObjectCoherence()
+	local gameObject = safeRawGet(self._environment, "game") or safeRawGet(_G, "game")
+	if gameObject == nil then return end
+	local ok, valid = pcall(function()
+		return typeof(gameObject) == "Instance"
+			and gameObject:IsA("DataModel")
+			and type(gameObject.PlaceId) == "number"
+			and type(gameObject.JobId) == "string"
+	end)
+	if not ok or not valid then
+		self:reportSignal("L14_GAME_OBJECT_INVALID", { variant = ok and "identity" or "access-error" })
+	end
+end
+
+function RolandSecurity:_checkServiceCoherence()
+	local gameObject = safeRawGet(self._environment, "game") or safeRawGet(_G, "game")
+	if gameObject == nil then return end
+	local ok, coherent = pcall(function()
+		local playersA = gameObject:GetService("Players")
+		local playersB = gameObject:GetService("Players")
+		local httpA = gameObject:GetService("HttpService")
+		local httpB = gameObject:GetService("HttpService")
+		return playersA == playersB and httpA == httpB
+			and typeof(playersA) == "Instance" and playersA:IsA("Players")
+			and typeof(httpA) == "Instance" and httpA:IsA("HttpService")
+	end)
+	if not ok or not coherent then
+		self:reportSignal("L15_SERVICE_COHERENCE_FAILED", { variant = ok and "identity" or "access-error" })
+	end
+end
+
+function RolandSecurity:_checkTaskSchedulerCoherence()
+	local taskLibrary = safeRawGet(self._environment, "task") or safeRawGet(_G, "task") or task
+	if type(taskLibrary) ~= "table" then return end
+	local required = { "spawn", "defer", "delay", "wait" }
+	for _, name in ipairs(required) do
+		if type(safeRawGet(taskLibrary, name)) ~= "function" then
+			self:reportSignal("L16_TASK_SCHEDULER_INVALID", { variant = "missing-" .. name })
+			return
+		end
+	end
+end
+
+function RolandSecurity:_checkExecutorSurfaceCoherence()
+	local getEnvironment = safeRawGet(self._environment, "getgenv") or safeRawGet(_G, "getgenv")
+	if type(getEnvironment) ~= "function" then return end
+	local ok, resolved = pcall(getEnvironment)
+	if not ok or type(resolved) ~= "table" or resolved ~= self._environment then
+		self:reportSignal("L17_EXECUTOR_SURFACE_INCOHERENT", { variant = ok and "environment-mismatch" or "getgenv-error" })
+		return
+	end
+	local requestFunction = resolveRequest(self._environment)
+	if type(requestFunction) ~= "function" or type(resolveLoadstring(self._environment)) ~= "function" then
+		self:reportSignal("L17_EXECUTOR_SURFACE_INCOHERENT", { variant = "primitive-missing" })
+	end
+end
+
+function RolandSecurity:_checkDebugSurfaceCoherence()
+	local debugLibrary = safeRawGet(self._environment, "debug") or safeRawGet(_G, "debug") or debug
+	if type(debugLibrary) ~= "table" then return end
+	local getInfo = safeRawGet(debugLibrary, "getinfo")
+	local getUpvalues = safeRawGet(debugLibrary, "getupvalues")
+	local getConstants = safeRawGet(debugLibrary, "getconstants")
+	local advancedCount = (type(getUpvalues) == "function" and 1 or 0) + (type(getConstants) == "function" and 1 or 0)
+	if advancedCount > 0 and type(getInfo) ~= "function" then
+		self:reportSignal("L18_DEBUG_SURFACE_INCOHERENT", { variant = "partial-debug-api" })
+		return
+	end
+	if type(getInfo) == "function" then
+		local ok, info = pcall(getInfo, self._captured.loadstring)
+		if not ok or (info ~= nil and type(info) ~= "table") then
+			self:reportSignal("L18_DEBUG_SURFACE_INCOHERENT", { variant = ok and "invalid-info" or "getinfo-error" })
+		end
+	end
+end
+
+function RolandSecurity:_checkRuntimeContinuity()
+	local published = safeRawGet(self._environment, "__ROLAND_SECURITY_RUNTIME")
+	if published ~= nil and published ~= self then
+		self:reportSignal("L20_RUNTIME_CONTINUITY_BROKEN", { variant = "runtime-replaced" })
+	end
+end
+
 function RolandSecurity:runChecks(phase)
 	if self._state ~= "ACTIVE" and self._state ~= "QUARANTINED" then
 		return false, "not-active"
@@ -4824,6 +4933,12 @@ function RolandSecurity:runChecks(phase)
 		function() self:_checkLoadstringSource() end,
 		function() self:_checkUiArtifacts() end,
 		function() self:_checkHttpChannel() end,
+		function() self:_checkGameObjectCoherence() end,
+		function() self:_checkServiceCoherence() end,
+		function() self:_checkTaskSchedulerCoherence() end,
+		function() self:_checkExecutorSurfaceCoherence() end,
+		function() self:_checkDebugSurfaceCoherence() end,
+		function() self:_checkRuntimeContinuity() end,
 	}
 	for index, check in ipairs(checks) do
 		local ok = pcall(check)
@@ -4991,6 +5106,10 @@ function RolandSecurity:downloadAuthorizedPayload()
 	end
 
 	local status, source, data, transportError, responseHeaders = self:_getPayload("/v1/runtime/payload")
+	local payloadErrorCode = responseErrorCode(data)
+	if payloadErrorCode == "PAYLOAD_TICKET_DENIED" or payloadErrorCode == "PAYLOAD_TICKET_REPLAYED" then
+		self:reportSignal("L19_PAYLOAD_TICKET_INVALID", { variant = payloadErrorCode:lower() })
+	end
 	if status == 401 or status == 403 or TERMINAL_ERROR_CODES[responseErrorCode(data)] then
 		local code = responseErrorCode(data) or "SESSION_DENIED"
 		self:_handleTerminal(code, status)
@@ -5109,6 +5228,7 @@ function RolandSecurity:stop(reason)
 	end
 	self._stopping = true
 	self._sessionToken = nil
+	self._payloadTicket = nil
 	self._state = "STOPPED"
 	self._stopBusy = false
 	self:_notify("onStopped", safeString(reason or "client-stop", "client-stop"):sub(1, 128), status)
