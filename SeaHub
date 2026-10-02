@@ -4095,6 +4095,8 @@ function RolandSecurity.new(config)
 		"activationId must be a UUID")
 	self._activationId = self._activationId:lower()
 	self._heartbeatSequence = nil
+	self._policySequence = nil
+	self._policyChainDigest = string.rep("0", 64)
 	self._challenge = nil
 	self._capabilityDeadlineAt = math.huge
 	self._heartbeatAfter = 24
@@ -4367,6 +4369,9 @@ function RolandSecurity:activate()
 			and isSessionTokenForId(data.sessionToken, data.sessionId)
 			and isPayloadTicketForId(data.payloadTicket, data.sessionId)
 			and isIntegerInRange(data.nextHeartbeatSequence, 1, 2147483647)
+			and isIntegerInRange(data.nextPolicySequence, 1, 2147483647)
+			and type(data.policyChainDigest) == "string" and #data.policyChainDigest == 64
+			and data.policyChainDigest:match("^[a-fA-F0-9]+$") ~= nil
 			and (resumedActivation or data.nextHeartbeatSequence == 1)
 			and hasValidLeaseTiming(data)
 		if accepted then
@@ -4394,6 +4399,9 @@ function RolandSecurity:activate()
 		or not isSessionTokenForId(data.sessionToken, data.sessionId)
 		or not isPayloadTicketForId(data.payloadTicket, data.sessionId)
 		or not isIntegerInRange(data.nextHeartbeatSequence, 1, 2147483647)
+		or not isIntegerInRange(data.nextPolicySequence, 1, 2147483647)
+		or type(data.policyChainDigest) ~= "string" or #data.policyChainDigest ~= 64
+		or data.policyChainDigest:match("^[a-fA-F0-9]+$") == nil
 		or (not resumedActivation and data.nextHeartbeatSequence ~= 1)
 		or not hasValidLeaseTiming(data) then
 		return self:_rejectAcceptedActivation(data, status, "INVALID_ACTIVATION_RESPONSE")
@@ -4410,6 +4418,8 @@ function RolandSecurity:activate()
 	self._authorizedBuildId = data.buildId or self._payloadPolicy.buildId
 	self._authorizedBuild = authorizedBuild
 	self._heartbeatSequence = data.nextHeartbeatSequence
+	self._policySequence = data.nextPolicySequence
+	self._policyChainDigest = data.policyChainDigest:lower()
 	if data.challenge ~= nil then
 		if not hasValidChallenge(data.challenge, data.nextHeartbeatSequence)
 			or not isIntegerInRange(data.capabilityLeaseRemainingSeconds, 10, 90) then
@@ -5854,8 +5864,8 @@ function RolandSecurity:shadowFruitCollection(options, authoritativeAllowed, aut
 	return nil
 end
 
--- Authoritative protected decision. Any lease, artifact, decode or output
--- failure denies collection instead of falling back to plaintext policy logic.
+-- Authoritative server-side decision. The public VM remains observation-only;
+-- it can never grant collection when the session chain is unavailable.
 function RolandSecurity:decideFruitCollection(options)
 	local stats = self._shadowStats.fruit
 	stats.calls = stats.calls + 1
@@ -5871,22 +5881,64 @@ function RolandSecurity:decideFruitCollection(options)
 		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode or "PRE_ACTION_GUARD_BLOCKED")
 		return false, "security-unavailable"
 	end
-	local evaluated, result = self:_evaluateFruitCollection(options)
-	if not evaluated then
+	if not isIntegerInRange(self._policySequence, 1, 2147483647)
+		or type(self._policyChainDigest) ~= "string" or #self._policyChainDigest ~= 64 then
 		stats.failures = stats.failures + 1
-		self._lastErrorCode = safeString(result or "FRUIT_POLICY_UNAVAILABLE", "FRUIT_POLICY_UNAVAILABLE"):upper()
+		self._lastErrorCode = "FRUIT_POLICY_CHAIN_UNAVAILABLE"
 		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode)
 		return false, "security-unavailable"
 	end
-	if (result.allowed and result.reason ~= "eligible")
-		or (not result.allowed and result.reason == "eligible") then
+	if type(options) ~= "table" then
 		stats.failures = stats.failures + 1
-		self._lastErrorCode = "FRUIT_POLICY_RESULT_INCONSISTENT"
+		return false, "security-unavailable"
+	end
+	local normalized = {
+		level = finiteNumberOrZero(options.level),
+		blocked = options.blocked == true,
+		duplicate = options.duplicate == true,
+		expBoostRemaining = finiteNumberOrZero(options.expBoostRemaining),
+		hasIdentity = options.hasIdentity == true,
+		value = finiteNumberOrZero(options.value),
+	}
+	local sequence = self._policySequence
+	local requestBody = {
+		sequence = sequence,
+		previousDigest = self._policyChainDigest,
+		options = normalized,
+	}
+	local status, data, transportError = 0, nil, nil
+	for attempt = 1, 2 do
+		status, data, transportError = self:_post("/v1/runtime/policy/fruit", requestBody, true)
+		if status == 200 or (status ~= 0 and status < 500) then break end
+		if attempt == 1 then self._adapters.wait(0.1) end
+	end
+	if status == 401 or status == 403 or TERMINAL_ERROR_CODES[responseErrorCode(data)] then
+		self:_handleTerminal(responseErrorCode(data) or "SESSION_DENIED", status)
+		stats.failures = stats.failures + 1
+		return false, "security-unavailable"
+	end
+	local validReasons = {
+		level = true, ["progression-item"] = true, duplicate = true,
+		["boost-unknown-fruit"] = true, ["boost-low-value"] = true, eligible = true,
+	}
+	if status ~= 200 or type(data) ~= "table" or data.sessionId ~= self._sessionId
+		or data.sequence ~= sequence or type(data.allowed) ~= "boolean"
+		or validReasons[data.reason] ~= true or type(data.chainDigest) ~= "string"
+		or #data.chainDigest ~= 64 or data.chainDigest:match("^[a-fA-F0-9]+$") == nil
+		or (data.allowed and data.reason ~= "eligible")
+		or (not data.allowed and data.reason == "eligible") then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = responseErrorCode(data) or transportError or "FRUIT_POLICY_RESPONSE_INVALID"
 		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode)
 		return false, "security-unavailable"
 	end
+	self._policySequence = sequence + 1
+	self._policyChainDigest = data.chainDigest:lower()
 	stats.comparisons = stats.comparisons + 1
-	return result.allowed, result.reason
+	-- Compare the bundled VM only as a migration diagnostic. Its answer is not
+	-- used to authorize gameplay and therefore cannot bypass the backend.
+	self:shadowFruitCollection(normalized, data.allowed, data.reason)
+	return data.allowed, data.reason
 end
 
 function RolandSecurity:downloadAuthorizedPayload()
@@ -6079,6 +6131,8 @@ function RolandSecurity:getStatus()
 		sessionId = self._sessionId,
 		buildId = self._authorizedBuildId,
 		nextHeartbeatSequence = self._heartbeatSequence,
+		nextPolicySequence = self._policySequence,
+		policyChainDigest = self._policyChainDigest,
 		leaseRemainingSeconds = leaseRemaining,
 		shadow = {
 			fruit = shallowCopy(self._shadowStats.fruit),
