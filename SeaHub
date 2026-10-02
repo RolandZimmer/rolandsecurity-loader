@@ -2,7 +2,8 @@
 -- Ed25519 dependency notice: third_party/THIRD_PARTY_NOTICES.md
 repeat task.wait() until game:IsLoaded() and game:GetService("Players").LocalPlayer
 assert(type(buffer) == "table" and type(buffer.create) == "function", "executor lacks Luau buffer support")
-local __RLS_Environment = type(getgenv) == "function" and getgenv() or _G
+local __RLS_GetEnvironment = type(getgenv) == "function" and getgenv or function() return _G end
+local __RLS_Environment = __RLS_GetEnvironment()
 local __RLS_LicenseKey = rawget(__RLS_Environment, "script_key")
 rawset(__RLS_Environment, "script_key", nil)
 rawset(__RLS_Environment, "Script", nil)
@@ -57,12 +58,31 @@ end
 do
 	local isCClosure = __RLS_Read(__RLS_Environment, "iscclosure")
 	local isFunctionHooked = __RLS_Read(__RLS_Environment, "isfunctionhooked")
+	local getEnvironment = __RLS_Read(__RLS_Environment, "getgenv") or __RLS_GetEnvironment
 	local requestFunction = __RLS_ResolveRequest()
 	local compiler = __RLS_Read(__RLS_Environment, "loadstring")
+	local environmentOk, resolvedEnvironment = pcall(getEnvironment)
+	local compilerOk, canary = pcall(compiler, "return 104729", "=roland-preflight")
+	local canaryOk, canaryResult = false, nil
+	if compilerOk and type(canary) == "function" then
+		canaryOk, canaryResult = pcall(canary)
+	end
+	local builtinsOk = type(isCClosure) == "function"
+		and __RLS_IsNativePrimitive(rawget, isCClosure, isFunctionHooked)
+		and __RLS_IsNativePrimitive(rawset, isCClosure, isFunctionHooked)
+		and __RLS_IsNativePrimitive(pcall, isCClosure, isFunctionHooked)
+		and __RLS_IsNativePrimitive(type, isCClosure, isFunctionHooked)
+		and __RLS_IsNativePrimitive(tostring, isCClosure, isFunctionHooked)
 	if type(isCClosure) ~= "function"
 		or not __RLS_IsNativePrimitive(isCClosure, isCClosure, isFunctionHooked)
+		or not __RLS_IsNativePrimitive(getEnvironment, isCClosure, isFunctionHooked)
+		or (type(isFunctionHooked) == "function"
+			and not __RLS_IsNativePrimitive(isFunctionHooked, isCClosure, nil))
 		or not __RLS_IsNativePrimitive(requestFunction, isCClosure, isFunctionHooked)
-		or not __RLS_IsNativePrimitive(compiler, isCClosure, isFunctionHooked) then
+		or not __RLS_IsNativePrimitive(compiler, isCClosure, isFunctionHooked)
+		or not builtinsOk
+		or not environmentOk or resolvedEnvironment ~= __RLS_Environment
+		or not compilerOk or not canaryOk or canaryResult ~= 104729 then
 		__RLS_PreflightFail()
 	end
 end
@@ -4790,12 +4810,34 @@ function RolandSecurity:_telemetryLoop()
 	end
 end
 
+function RolandSecurity:_superviseLoop(name, callback)
+	local failures = 0
+	while not self._stopping and (self._state == "ACTIVE" or self._state == "QUARANTINED") do
+		local ok = pcall(callback, self)
+		if ok then return true end
+		failures = failures + 1
+		self:_notify("onRuntimeLoopError", name, failures)
+		if failures >= 3 then
+			self._lastErrorCode = "LOCAL_RUNTIME_LOOP_FAILED"
+			self:_quarantine("runtime-loop-failed")
+			return false
+		end
+		local waitOk = pcall(self._adapters.wait, math.min(4, 2 ^ (failures - 1)))
+		if not waitOk then
+			self._lastErrorCode = "LOCAL_RUNTIME_LOOP_FAILED"
+			self:_quarantine("runtime-loop-failed")
+			return false
+		end
+	end
+	return true
+end
+
 function RolandSecurity:_startLoops()
 	if self._manualScheduling then
 		return
 	end
-	self._adapters.spawn(function() self:_heartbeatLoop() end)
-	self._adapters.spawn(function() self:_telemetryLoop() end)
+	self._adapters.spawn(function() self:_superviseLoop("heartbeat", self._heartbeatLoop) end)
+	self._adapters.spawn(function() self:_superviseLoop("telemetry", self._telemetryLoop) end)
 end
 
 function RolandSecurity:_checkLoadstringHook()
@@ -5988,9 +6030,9 @@ local runtime = RolandSecurity.new({
 		hashSha256 = __RLS_HashSha256,
 		verifyPayloadSignature = __RLS_VerifyPayloadSignature,
 	},
-	activation = { startupJitterSeconds = 3, maxAttempts = 3, retryBaseSeconds = 0.25 },
+	activation = { startupJitterSeconds = 10, maxAttempts = 3, retryBaseSeconds = 0.25 },
 	shutdown = { maxAttempts = 3, retryBaseSeconds = 0.25, maxRetrySeconds = 2 },
-	queue = { maxQueuedEvents = 48, maxEventsPerMinute = 60, dedupSeconds = 60, maxDedupEntries = 256, flushBurst = 3, flushIntervalSeconds = 4 },
+	queue = { maxQueuedEvents = 32, maxEventsPerMinute = 30, dedupSeconds = 90, maxDedupEntries = 128, flushBurst = 3, flushIntervalSeconds = 8 },
 	leaseWatchdog = { graceSeconds = 3 },
 	shadowPolicies = { fruit = { enabled = true, sampleEvery = 16, artifact = "RLSVM1\n{\"format\":\"RLSVM1\",\"buildId\":\"00000000-0000-4000-8000-00000000b001\",\"entry\":0,\"opcodeMap\":{\"JUMP\":19,\"CONCAT\":32,\"GET_ARG\":45,\"JUMP_IF_FALSE\":58,\"GET_FIELD\":71,\"EQ\":84,\"SET_LOCAL\":97,\"AND\":110,\"RETURN\":123,\"MUL\":136,\"PUSH_CONST\":149,\"GET_GLOBAL\":162,\"NOT\":175,\"GTE\":188,\"ADD\":201,\"NE\":214,\"GT\":227,\"DUP\":240,\"CALL\":253,\"MAKE_TABLE\":266,\"NEG\":279,\"DIV\":292,\"OR\":305,\"SUB\":318,\"LT\":331,\"POP\":344,\"LTE\":357,\"GET_LOCAL\":370},\"code\":[[149,0],[45,0],[149,1],[188,0],[45,1],[175,0],[110,0],[45,2],[175,0],[110,0],[45,3],[149,2],[357,0],[45,4],[45,5],[149,3],[227,0],[110,0],[305,0],[110,0],[266,1],[123,1]],\"constantPages\":[{\"nonce\":\"jjTcsdIrN6WLZJe9mMqrbQ\",\"bytes\":\"oIKB2DlRCWpZP3LMkMea-1KlihB5PeV1fw\",\"sha256\":\"31028ea7a5a1d80adc2be8b2b334fd53ec047c6fb8de7c075f000135f1e0b683\"}],\"keyMask\":\"xcqw-pY7n-eHbJHv09VUnpgawiD9FEByyHs0kjYCMsY\",\"keyWrapped\":\"Ut-5G5BVsSDR5nP8fddnDbL-tBNgeBTLf3xfSuHZEpk\"}" } },
 	callbacks = {
