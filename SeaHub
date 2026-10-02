@@ -4034,7 +4034,7 @@ function RolandSecurity.new(config)
 	self._detectorVersion = (config.detectorVersion or DEFAULT_DETECTOR_VERSION):sub(1, 64)
 	self._mode = config.mode == "quarantine" and "quarantine" or "observe"
 	self._manualScheduling = config.manualScheduling == true
-	for _, name in ipairs({ "callbacks", "detectors", "payloadPolicy", "quarantine", "queue", "activation", "shutdown", "leaseWatchdog", "shadowPolicies" }) do
+	for _, name in ipairs({ "callbacks", "detectors", "payloadPolicy", "quarantine", "queue", "activation", "shutdown", "leaseWatchdog", "preActionGuards", "shadowPolicies" }) do
 		assert(config[name] == nil or type(config[name]) == "table", name .. " must be a table")
 	end
 	self._callbacks = config.callbacks or {}
@@ -4045,6 +4045,8 @@ function RolandSecurity.new(config)
 	self._activationConfig = config.activation or {}
 	self._shutdownConfig = config.shutdown or {}
 	self._leaseConfig = config.leaseWatchdog or {}
+	self._preActionConfig = config.preActionGuards or {}
+	self._preActionLastAt = {}
 	self._shadowPolicies = config.shadowPolicies or {}
 	self._shadowStats = {
 		fruit = { calls = 0, comparisons = 0, mismatches = 0, failures = 0 },
@@ -5281,6 +5283,47 @@ function RolandSecurity:runChecks(phase)
 	return true
 end
 
+-- Small, action-local checks close the gap between periodic heartbeat probes.
+-- Each surface is throttled independently so hot gameplay paths do not turn a
+-- 60-tab host into a synchronized scanner storm.
+function RolandSecurity:_preActionGuard(surface)
+	if self._state ~= "ACTIVE" then
+		return false, self._state == "QUARANTINED" and "quarantined" or "not-active"
+	end
+	local now = self._adapters.clock()
+	if now >= self._capabilityDeadlineAt then
+		self:_notify("onCapabilityLeaseExpired")
+		return false, "capability-lease-expired"
+	end
+	local interval = clamp(tonumber(self._preActionConfig.minimumIntervalSeconds) or 4, 1, 30)
+	local lastAt = self._preActionLastAt[surface]
+	if lastAt ~= nil and now - lastAt < interval then return true end
+	self._preActionLastAt[surface] = now
+
+	local checks
+	if surface == "transport" then
+		checks = { self._checkHttpChannel, self._checkExecutorSurfaceCoherence, self._checkRuntimeContinuity }
+	elseif surface == "compiler" then
+		checks = { self._checkLoadstringHook, self._checkGlobalEnvironment, self._checkRuntimeContinuity }
+	else
+		checks = { self._checkExecutorSurfaceCoherence, self._checkRuntimeContinuity }
+	end
+	local chainBefore = self._chainIndex
+	for _, check in ipairs(checks) do
+		local ok = pcall(check, self)
+		if not ok then
+			self:_notify("onDetectorError", surface, "pre-action")
+			self._lastErrorCode = "PRE_ACTION_GUARD_ERROR"
+			return false, "pre-action-guard-error"
+		end
+	end
+	if self._chainIndex > chainBefore or self._state ~= "ACTIVE" then
+		self._lastErrorCode = "PRE_ACTION_GUARD_BLOCKED"
+		return false, "pre-action-guard-blocked"
+	end
+	return true
+end
+
 function RolandSecurity:verifyPayload(source, envelope)
 	assert(type(source) == "string", "payload source must be a string")
 	assert(type(envelope) == "table", "payload envelope is required")
@@ -5364,6 +5407,8 @@ function RolandSecurity:verifyPayload(source, envelope)
 end
 
 function RolandSecurity:compileProtected(source, chunkName)
+	local guarded, guardError = self:_preActionGuard("compiler")
+	if not guarded then return nil, guardError end
 	local compiler = self._captured.loadstring
 	if type(compiler) ~= "function" then
 		self:reportSignal("L12_PAYLOAD_COMPILATION_FAILED", { variant = "compiler-unavailable", payloadBytes = #source })
@@ -5385,13 +5430,8 @@ end
 function RolandSecurity:runProtected(label, callback, ...)
 	assert(type(callback) == "function", "protected callback must be a function")
 	self:_checkLeaseWatchdog()
-	if self._state ~= "ACTIVE" then
-		return false, self._state == "QUARANTINED" and "quarantined" or "not-active"
-	end
-	if self._adapters.clock() >= self._capabilityDeadlineAt then
-		self:_notify("onCapabilityLeaseExpired")
-		return false, "capability-lease-expired"
-	end
+	local guarded, guardError = self:_preActionGuard("runtime")
+	if not guarded then return false, guardError end
 	self._protectedPayloadStarted = true
 	local arguments = table.pack(...)
 	local results = table.pack(pcall(function()
@@ -5825,6 +5865,12 @@ function RolandSecurity:decideFruitCollection(options)
 		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode)
 		return false, "security-unavailable"
 	end
+	local guarded = self:_preActionGuard("vm")
+	if not guarded then
+		stats.failures = stats.failures + 1
+		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode or "PRE_ACTION_GUARD_BLOCKED")
+		return false, "security-unavailable"
+	end
 	local evaluated, result = self:_evaluateFruitCollection(options)
 	if not evaluated then
 		stats.failures = stats.failures + 1
@@ -5851,6 +5897,8 @@ function RolandSecurity:downloadAuthorizedPayload()
 	if self._authorizedBuild == nil then
 		return false, "authorized-build-unavailable"
 	end
+	local guarded, guardError = self:_preActionGuard("transport")
+	if not guarded then return false, guardError end
 
 	local status, source, data, transportError, responseHeaders = self:_getPayload("/v1/runtime/payload")
 	local payloadErrorCode = responseErrorCode(data)
@@ -6201,6 +6249,7 @@ local runtime = RolandSecurity.new({
 	shutdown = { maxAttempts = 3, retryBaseSeconds = 0.25, maxRetrySeconds = 2 },
 	queue = { maxQueuedEvents = 32, maxEventsPerMinute = 30, dedupSeconds = 90, maxDedupEntries = 128, flushBurst = 3, flushIntervalSeconds = 8 },
 	leaseWatchdog = { graceSeconds = 3 },
+	preActionGuards = { minimumIntervalSeconds = 4 },
 	shadowPolicies = { fruit = { enabled = true, sampleEvery = 16, artifact = "RLSVM1\n{\"format\":\"RLSVM1\",\"buildId\":\"00000000-0000-4000-8000-00000000b001\",\"entry\":0,\"opcodeMap\":{\"LTE\":19,\"OR\":32,\"NOT\":45,\"RETURN\":58,\"DUP\":71,\"NEG\":84,\"GTE\":97,\"MUL\":110,\"SET_LOCAL\":123,\"GET_ARG\":136,\"POP\":149,\"JUMP_IF_FALSE\":162,\"DIV\":175,\"ADD\":188,\"EQ\":201,\"GET_FIELD\":214,\"LT\":227,\"NE\":240,\"CONCAT\":253,\"GT\":266,\"SUB\":279,\"CALL\":292,\"AND\":305,\"MAKE_TABLE\":318,\"JUMP\":331,\"GET_LOCAL\":344,\"PUSH_CONST\":357,\"GET_GLOBAL\":370},\"code\":[[136,0],[357,0],[97,0],[136,1],[45,0],[305,0],[136,2],[45,0],[305,0],[136,3],[357,1],[19,0],[136,4],[136,5],[357,2],[266,0],[305,0],[32,0],[305,0],[123,0],[136,0],[357,0],[227,0],[357,3],[305,0],[136,1],[357,4],[305,0],[32,0],[136,2],[357,5],[305,0],[32,0],[136,3],[357,1],[266,0],[136,4],[45,0],[305,0],[357,6],[305,0],[32,0],[136,3],[357,1],[266,0],[136,5],[357,2],[19,0],[305,0],[357,7],[305,0],[32,0],[357,8],[32,0],[123,1],[357,9],[344,0],[357,10],[344,1],[318,2],[58,1]],\"constantPages\":[{\"nonce\":\"P_VwXvWhNZWaykpGI0p-4A\",\"bytes\":\"rmTpSeCZbBf5IOFC5I7DVLJny7SgOm8hx5gn877xOiWFOqHeDiUYM6v_SqMERT2MIdWFOAocwjFsNeBodavM_FGrADvEj7WyDX_EtWqkwvjliy336xBZr43hwBUVT8xGnxvFArW0xIcr0POEQFubTovcWdd8Fm5CJ9C8yw\",\"sha256\":\"0a42f565b583eb8fd2d78e8270402a6807ac7cd1482b9e23c22010f0c85407a7\"}],\"keyMask\":\"x0NU-DU7bXqeA8-Dw-jpm7mgsJrBo9cUmVTgzfiiBwE\",\"keyWrapped\":\"qKhGgN03HANEOLddJjG0a31ihCPsiv1YyszB-kxWx3A\"}" } },
 	callbacks = {
 		onSessionCredential = __RLS_PersistSessionToken,
