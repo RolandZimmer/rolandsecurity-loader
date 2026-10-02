@@ -6192,7 +6192,7 @@ do
 end
 
 local __RLS_ProductCode = "KAITUN"
-local __RLS_LoaderUrl = "https://raw.githubusercontent.com/RolandZimmer/rolandsecurity-loader/main/SeaHub-bootstrap-kaitun-2026.10.2-r23.lua"
+local __RLS_LoaderUrl = "https://raw.githubusercontent.com/RolandZimmer/rolandsecurity-loader/main/SeaHub-bootstrap-kaitun-2026.10.2-r24.lua"
 
 local __RLS_LocalPlayer = game:GetService("Players").LocalPlayer
 local __RLS_RobloxUserId = tostring(__RLS_LocalPlayer.UserId)
@@ -6388,6 +6388,8 @@ local runtime = RolandSecurity.new({
 rawset(__RLS_Environment, "__RLS_FruitCollectionDecision", function(options)
 	return runtime:decideFruitCollection(options)
 end)
+rawset(__RLS_Environment, "__SEAHUB_UI_ENABLED", false)
+rawset(__RLS_Environment, "__SEAHUB_BLACK_SCREEN_ENABLED", false)
 rawset(__RLS_Environment, "__ROLAND_SECURITY_RUNTIME", runtime)
 local activated, activationError = runtime:start()
 if not activated then error("Roland Security activation failed: " .. tostring(activationError), 0) end
@@ -6398,6 +6400,8 @@ if not executed then
 	runtime:stop("payload-start-failed")
 	error("Roland Security payload failed: " .. tostring(result), 0)
 end
+local playerGui = game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+if playerGui then for _, guiName in ipairs({ "SeaHubUI", "SeaHubLegacyUI" }) do local gui = playerGui:FindFirstChild(guiName); if gui then gui:Destroy() end end end
 local queueOk, queueError = __RLS_RegisterTeleportResume()
 rawset(__RLS_Environment, "__RLS_TELEPORT_RESUME_STATUS", { registered = queueOk, error = queueError })
 for _, delaySeconds in ipairs({ 2, 5 }) do task.delay(delaySeconds, function() local ok, err = __RLS_RegisterTeleportResume(); rawset(__RLS_Environment, "__RLS_TELEPORT_RESUME_STATUS", { registered = ok, error = err }) end) end
