@@ -10,7 +10,7 @@ rawset(__RLS_Environment, "Script", nil)
 assert(type(__RLS_LicenseKey) == "string" and #__RLS_LicenseKey > 0, "script_key is required")
 
 local __RLS_PreflightBaseUrl = "https://api-staging-edb8.up.railway.app"
-local __RLS_PreflightClientVersion = "kaitun-2026.10.4"
+local __RLS_PreflightClientVersion = "kaitun-2026.10.5"
 local __RLS_PreflightBlacklistMessage = "YOUR KEY HAS BEEN BLACKLISTED FOR INTENTIONALLY TAKING OUR SOURCECODE."
 
 local function __RLS_PreflightStop(message)
@@ -4052,6 +4052,7 @@ function RolandSecurity.new(config)
 		fruit = { calls = 0, comparisons = 0, mismatches = 0, failures = 0 },
 		raid = { calls = 0, comparisons = 0, mismatches = 0, failures = 0 },
 		levelRoute = { calls = 0, comparisons = 0, mismatches = 0, failures = 0 },
+		questSelection = { calls = 0, comparisons = 0, mismatches = 0, failures = 0 },
 	}
 	self._shadowFruit = type(self._shadowPolicies.fruit) == "table"
 		and shallowCopy(self._shadowPolicies.fruit) or nil
@@ -6130,6 +6131,99 @@ function RolandSecurity:decideLevelRoute(options)
 	}, "authorized"
 end
 
+function RolandSecurity:decideQuestSelection(options)
+	local stats = self._shadowStats.questSelection
+	stats.calls = stats.calls + 1
+	if not self:_checkLeaseWatchdog() or self._state ~= "ACTIVE"
+		or type(options) ~= "table" then
+		stats.failures = stats.failures + 1
+		return nil, "security-unavailable"
+	end
+	if not self:_preActionGuard("vm")
+		or not isIntegerInRange(self._policySequence, 1, 2147483647)
+		or type(self._policyChainDigest) ~= "string" or #self._policyChainDigest ~= 64
+		or not self:_acquirePolicyLock(5) then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = self._lastErrorCode or "QUEST_SELECTION_POLICY_UNAVAILABLE"
+		return nil, "security-unavailable"
+	end
+	local sea = math.floor(finiteNumberOrZero(options.sea))
+	if sea < 1 or sea > 3 then sea = 1 end
+	local function optionalString(value, maximum)
+		if type(value) ~= "string" or value == "" then return nil end
+		return value:sub(1, maximum)
+	end
+	local function optionalInteger(value, minimum, maximum)
+		value = tonumber(value)
+		if value == nil then return nil end
+		value = math.floor(value)
+		if value < minimum or value > maximum then return nil end
+		return value
+	end
+	local normalized = {
+		sea = sea,
+		level = finiteNumberOrZero(options.level),
+		previousFamily = optionalString(options.previousFamily, 64),
+		previousTurn = optionalInteger(options.previousTurn, 1, 2),
+		completedSequence = math.max(0, math.floor(finiteNumberOrZero(options.completedSequence))),
+		lastCompletionSequence = optionalInteger(options.lastCompletionSequence, 0, 2147483647),
+		acceptedFamily = optionalString(options.acceptedFamily, 64),
+		acceptedQuestNumber = optionalInteger(options.acceptedQuestNumber, 1, 100),
+		activeQuestText = optionalString(options.activeQuestText, 256),
+	}
+	local sequence = self._policySequence
+	local requestBody = { sequence = sequence, previousDigest = self._policyChainDigest, options = normalized }
+	local status, data, transportError = 0, nil, nil
+	for attempt = 1, 2 do
+		status, data, transportError = self:_post("/v1/runtime/policy/quest-selection", requestBody, true)
+		if status == 200 or (status ~= 0 and status < 500) then break end
+		if attempt == 1 then self._adapters.wait(0.1) end
+	end
+	if status == 401 or status == 403 or TERMINAL_ERROR_CODES[responseErrorCode(data)] then
+		self._policyBusy = false
+		self:_handleTerminal(responseErrorCode(data) or "SESSION_DENIED", status)
+		stats.failures = stats.failures + 1
+		return nil, "security-unavailable"
+	end
+	local unavailable = data and data.reason == "unavailable"
+	local selected = data and type(data.family) == "string" and #data.family <= 64
+		and isIntegerInRange(data.questNumber, 1, 100)
+		and type(data.mobName) == "string" and #data.mobName <= 96
+		and isIntegerInRange(data.levelRequired, 0, 100000)
+		and isIntegerInRange(data.turn, 1, 2)
+	local validReasons = {
+		["runtime-enter"] = true, ["family-enter"] = true,
+		["quest-completed"] = true, ["quest-in-progress"] = true,
+		unavailable = true,
+	}
+	if status ~= 200 or type(data) ~= "table" or data.sessionId ~= self._sessionId
+		or data.sequence ~= sequence or (selected ~= true and unavailable ~= true)
+		or validReasons[data.reason] ~= true
+		or not isIntegerInRange(data.completionSequence, 0, 2147483647)
+		or type(data.chainDigest) ~= "string" or #data.chainDigest ~= 64
+		or data.chainDigest:match("^[a-fA-F0-9]+$") == nil then
+		self._policyBusy = false
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = responseErrorCode(data) or transportError or "QUEST_SELECTION_POLICY_RESPONSE_INVALID"
+		self:_notify("onProtectedPolicyError", "quest-selection", self._lastErrorCode)
+		return nil, "security-unavailable"
+	end
+	self._policySequence = sequence + 1
+	self._policyChainDigest = data.chainDigest:lower()
+	self._policyBusy = false
+	stats.comparisons = stats.comparisons + 1
+	if unavailable then return nil, "unavailable" end
+	return {
+		family = data.family,
+		questNumber = data.questNumber,
+		mobName = data.mobName,
+		levelRequired = data.levelRequired,
+		turn = data.turn,
+		completionSequence = data.completionSequence,
+		reason = data.reason,
+	}, "authorized"
+end
+
 function RolandSecurity:downloadAuthorizedPayload()
 	self:_checkLeaseWatchdog()
 	if self._state ~= "ACTIVE" then
@@ -6327,6 +6421,7 @@ function RolandSecurity:getStatus()
 			fruit = shallowCopy(self._shadowStats.fruit),
 			raid = shallowCopy(self._shadowStats.raid),
 			levelRoute = shallowCopy(self._shadowStats.levelRoute),
+			questSelection = shallowCopy(self._shadowStats.questSelection),
 		},
 	}
 end
@@ -6364,7 +6459,7 @@ do
 end
 
 local __RLS_ProductCode = "KAITUN"
-local __RLS_LoaderUrl = "https://raw.githubusercontent.com/RolandZimmer/rolandsecurity-loader/main/SeaHub-bootstrap-kaitun-2026.10.4-r26.lua"
+local __RLS_LoaderUrl = "https://raw.githubusercontent.com/RolandZimmer/rolandsecurity-loader/main/SeaHub-bootstrap-kaitun-2026.10.5-r27.lua"
 
 local __RLS_LocalPlayer = game:GetService("Players").LocalPlayer
 local __RLS_RobloxUserId = tostring(__RLS_LocalPlayer.UserId)
@@ -6476,6 +6571,7 @@ local function __RLS_StopSeaHub(reason)
 	rawset(__RLS_Environment, "__RLS_FruitCollectionDecision", nil)
 	rawset(__RLS_Environment, "__RLS_RaidDecision", nil)
 	rawset(__RLS_Environment, "__RLS_LevelRouteDecision", nil)
+	rawset(__RLS_Environment, "__RLS_QuestSelectionDecision", nil)
 	rawset(__RLS_Environment, "__ROLAND_SECURITY_STOP_REASON", tostring(reason or "security-stop"))
 	local controller = rawget(__RLS_Environment, "SeaHubCleanController")
 	if type(controller) == "table" and type(controller.stop) == "function" then
@@ -6530,7 +6626,7 @@ local runtime = RolandSecurity.new({
 	baseUrl = "https://api-staging-edb8.up.railway.app",
 	key = __RLS_LicenseKey,
 	resumeToken = __RLS_ResumeToken,
-	clientVersion = "kaitun-2026.10.4",
+	clientVersion = "kaitun-2026.10.5",
 	deployment = "production",
 	mode = "quarantine",
 	payloadPolicy = {
@@ -6567,6 +6663,9 @@ rawset(__RLS_Environment, "__RLS_RaidDecision", function(options)
 end)
 rawset(__RLS_Environment, "__RLS_LevelRouteDecision", function(options)
 	return runtime:decideLevelRoute(options)
+end)
+rawset(__RLS_Environment, "__RLS_QuestSelectionDecision", function(options)
+	return runtime:decideQuestSelection(options)
 end)
 rawset(__RLS_Environment, "__SEAHUB_UI_ENABLED", false)
 rawset(__RLS_Environment, "__SEAHUB_BLACK_SCREEN_ENABLED", false)
