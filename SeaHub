@@ -9,13 +9,17 @@ rawset(__RLS_Environment, "script_key", nil)
 rawset(__RLS_Environment, "Script", nil)
 assert(type(__RLS_LicenseKey) == "string" and #__RLS_LicenseKey > 0, "script_key is required")
 
-local function __RLS_PreflightFail()
+local __RLS_PreflightBaseUrl = "https://api-staging-edb8.up.railway.app"
+local __RLS_PreflightClientVersion = "kaitun-2026.10.2"
+local __RLS_PreflightBlacklistMessage = "YOUR KEY HAS BEEN BLACKLISTED FOR INTENTIONALLY TAKING OUR SOURCECODE."
+
+local function __RLS_PreflightStop(message)
 	rawset(__RLS_Environment, "script_key", nil)
 	rawset(__RLS_Environment, "Script", nil)
 	local playersOk, players = pcall(game.GetService, game, "Players")
 	local player = playersOk and players and players.LocalPlayer or nil
 	if player then
-		pcall(player.Kick, player, "SECURITY PREFLIGHT FAILED.")
+		pcall(player.Kick, player, message or "SECURITY PREFLIGHT FAILED.")
 	end
 	error("Roland Security preflight failed", 0)
 end
@@ -55,12 +59,37 @@ local function __RLS_IsNativePrimitive(candidate, isCClosure, isFunctionHooked)
 	return true
 end
 
+local function __RLS_PreflightRequest(requestFunction, path, payload)
+	local httpService = game:GetService("HttpService")
+	local ok, response = pcall(requestFunction, {
+		Url = __RLS_PreflightBaseUrl .. path,
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = httpService:JSONEncode(payload)
+	})
+	if not ok or type(response) ~= "table" then return nil end
+	local status = tonumber(response.StatusCode or response.Status or response.status_code)
+	local rawBody = response.Body or response.body
+	if not status or status < 200 or status >= 300 or type(rawBody) ~= "string" then return nil end
+	local decodeOk, decoded = pcall(httpService.JSONDecode, httpService, rawBody)
+	if not decodeOk or type(decoded) ~= "table" then return nil end
+	return decoded
+end
+
 do
 	local isCClosure = __RLS_Read(__RLS_Environment, "iscclosure")
 	local isFunctionHooked = __RLS_Read(__RLS_Environment, "isfunctionhooked")
 	local getEnvironment = __RLS_Read(__RLS_Environment, "getgenv") or __RLS_GetEnvironment
 	local requestFunction = __RLS_ResolveRequest()
 	local compiler = __RLS_Read(__RLS_Environment, "loadstring")
+	if type(requestFunction) ~= "function" then __RLS_PreflightStop("SECURITY PREFLIGHT FAILED.") end
+	local claim = __RLS_PreflightRequest(requestFunction, "/v1/runtime/preflight/open", {
+		key = __RLS_LicenseKey,
+		clientVersion = __RLS_PreflightClientVersion
+	})
+	if type(claim) ~= "table" or type(claim.claimToken) ~= "string" then
+		__RLS_PreflightStop("SECURITY PREFLIGHT FAILED.")
+	end
 	local environmentOk, resolvedEnvironment = pcall(getEnvironment)
 	local compilerOk, canary = pcall(compiler, "return 104729", "=roland-preflight")
 	local canaryOk, canaryResult = false, nil
@@ -73,17 +102,39 @@ do
 		and __RLS_IsNativePrimitive(pcall, isCClosure, isFunctionHooked)
 		and __RLS_IsNativePrimitive(type, isCClosure, isFunctionHooked)
 		and __RLS_IsNativePrimitive(tostring, isCClosure, isFunctionHooked)
+	local signals = {}
+	if not compilerOk or not canaryOk or canaryResult ~= 104729
+		or not __RLS_IsNativePrimitive(compiler, isCClosure, isFunctionHooked) then
+		table.insert(signals, "COMPILER")
+	end
+	if not __RLS_IsNativePrimitive(requestFunction, isCClosure, isFunctionHooked) then
+		table.insert(signals, "TRANSPORT")
+	end
+	if not environmentOk or resolvedEnvironment ~= __RLS_Environment
+		or not __RLS_IsNativePrimitive(getEnvironment, isCClosure, isFunctionHooked) then
+		table.insert(signals, "ENVIRONMENT")
+	end
 	if type(isCClosure) ~= "function"
 		or not __RLS_IsNativePrimitive(isCClosure, isCClosure, isFunctionHooked)
-		or not __RLS_IsNativePrimitive(getEnvironment, isCClosure, isFunctionHooked)
-		or (type(isFunctionHooked) == "function"
-			and not __RLS_IsNativePrimitive(isFunctionHooked, isCClosure, nil))
-		or not __RLS_IsNativePrimitive(requestFunction, isCClosure, isFunctionHooked)
-		or not __RLS_IsNativePrimitive(compiler, isCClosure, isFunctionHooked)
-		or not builtinsOk
-		or not environmentOk or resolvedEnvironment ~= __RLS_Environment
-		or not compilerOk or not canaryOk or canaryResult ~= 104729 then
-		__RLS_PreflightFail()
+		or (type(isFunctionHooked) == "function" and not __RLS_IsNativePrimitive(isFunctionHooked, isCClosure, nil))
+		or not builtinsOk then
+		table.insert(signals, "NATIVE")
+	end
+	if #signals > 0 then
+		local failed = __RLS_PreflightRequest(requestFunction, "/v1/runtime/preflight/fail", {
+			claimToken = claim.claimToken,
+			signals = signals
+		})
+		if type(failed) == "table" and failed.status == "BLACKLISTED" then
+			__RLS_PreflightStop(__RLS_PreflightBlacklistMessage)
+		end
+		__RLS_PreflightStop("SECURITY PREFLIGHT FAILED.")
+	end
+	local completed = __RLS_PreflightRequest(requestFunction, "/v1/runtime/preflight/complete", {
+		claimToken = claim.claimToken
+	})
+	if type(completed) ~= "table" or completed.status ~= "PASSED" then
+		__RLS_PreflightStop("SECURITY PREFLIGHT FAILED.")
 	end
 end
 
