@@ -3150,12 +3150,6 @@ local VM_OPERATION_SET = {
 	ADD = true, SUB = true, MUL = true, DIV = true, CONCAT = true, AND = true, OR = true,
 	JUMP = true, JUMP_IF_FALSE = true, RETURN = true, GET_LOCAL = true, SET_LOCAL = true, MAKE_TABLE = true,
 }
-local VM_REQUIRED_OPERATION_SET = {
-	PUSH_CONST = true, GET_GLOBAL = true, GET_FIELD = true, CALL = true, POP = true, DUP = true,
-	GET_ARG = true, EQ = true, NE = true, LT = true, LTE = true, GT = true, GTE = true, NOT = true, NEG = true,
-	ADD = true, SUB = true, MUL = true, DIV = true, CONCAT = true, AND = true, OR = true,
-	JUMP = true, JUMP_IF_FALSE = true, RETURN = true,
-}
 local TERMINAL_ERROR_CODES = {
 	SESSION_DENIED = true,
 	LICENSE_DENIED = true,
@@ -3414,8 +3408,25 @@ local function shallowCopy(source)
 	return copy
 end
 
+local function cloneVmArtifact(source)
+	local copy = shallowCopy(source)
+	copy.constantPages = {}
+	for index, page in ipairs(source and source.constantPages or {}) do
+		copy.constantPages[index] = shallowCopy(page)
+	end
+	return copy
+end
+
 local function clamp(value, minimum, maximum)
 	return math.max(minimum, math.min(maximum, value))
+end
+
+local function finiteNumberOrZero(value)
+	local number = type(value) == "number" and value or tonumber(value)
+	if type(number) ~= "number" or number ~= number or number == math.huge or number == -math.huge then
+		return 0
+	end
+	return number
 end
 
 local function isIntegerInRange(value, minimum, maximum)
@@ -3892,7 +3903,7 @@ function RolandSecurity.new(config)
 	self._detectorVersion = (config.detectorVersion or DEFAULT_DETECTOR_VERSION):sub(1, 64)
 	self._mode = config.mode == "quarantine" and "quarantine" or "observe"
 	self._manualScheduling = config.manualScheduling == true
-	for _, name in ipairs({ "callbacks", "detectors", "payloadPolicy", "quarantine", "queue", "activation", "shutdown", "leaseWatchdog" }) do
+	for _, name in ipairs({ "callbacks", "detectors", "payloadPolicy", "quarantine", "queue", "activation", "shutdown", "leaseWatchdog", "shadowPolicies" }) do
 		assert(config[name] == nil or type(config[name]) == "table", name .. " must be a table")
 	end
 	self._callbacks = config.callbacks or {}
@@ -3903,6 +3914,28 @@ function RolandSecurity.new(config)
 	self._activationConfig = config.activation or {}
 	self._shutdownConfig = config.shutdown or {}
 	self._leaseConfig = config.leaseWatchdog or {}
+	self._shadowPolicies = config.shadowPolicies or {}
+	self._shadowStats = {
+		fruit = { calls = 0, comparisons = 0, mismatches = 0, failures = 0 },
+	}
+	self._shadowFruit = type(self._shadowPolicies.fruit) == "table"
+		and shallowCopy(self._shadowPolicies.fruit) or nil
+	if self._shadowFruit then
+		local artifact = self._shadowFruit.artifact
+		if type(artifact) == "string" then
+			local source = artifact:sub(1, 7) == "RLSVM1\n" and artifact:sub(8) or artifact
+			local decodeOk, decoded = pcall(adapters.jsonDecode, source)
+			if decodeOk and type(decoded) == "table" then
+				artifact = decoded
+			else
+				artifact = nil
+			end
+		end
+		self._shadowFruitArtifact = type(artifact) == "table" and artifact or nil
+		if self._shadowFruitArtifact == nil then
+			self._shadowFruit.enabled = false
+		end
+	end
 	self._diagnosticEnabled = config.deployment == "staging"
 		and type(config.diagnostics) == "table"
 		and config.diagnostics.enabled == true
@@ -5529,6 +5562,84 @@ function RolandSecurity:executeAuthorizedPayload(source, chunkName, ...)
 	return self:executePayload(source, self._authorizedBuild, chunkName, ...)
 end
 
+-- Run the FruitCollectionPolicy artifact beside the real Lua policy.  This is
+-- deliberately observation-only: the return values are never consumed by the
+-- caller, and every failure is reduced to a bounded callback/stat counter.
+function RolandSecurity:shadowFruitCollection(options, authoritativeAllowed, authoritativeReason)
+	local policy = self._shadowFruit
+	local artifact = self._shadowFruitArtifact
+	if (self._state ~= "ACTIVE" and self._state ~= "QUARANTINED")
+		or type(policy) ~= "table" or policy.enabled ~= true or type(artifact) ~= "table" then
+		return nil
+	end
+	if type(options) ~= "table" then
+		return nil
+	end
+
+	local stats = self._shadowStats.fruit
+	stats.calls = stats.calls + 1
+	local sampleEvery = math.floor(tonumber(policy.sampleEvery) or 1)
+	sampleEvery = clamp(sampleEvery, 1, 1000)
+	if (stats.calls - 1) % sampleEvery ~= 0 then
+		return nil
+	end
+	stats.comparisons = stats.comparisons + 1
+	local normalized = {
+		level = finiteNumberOrZero(options.level),
+		blocked = options.blocked == true,
+		duplicate = options.duplicate == true,
+		expBoostRemaining = finiteNumberOrZero(options.expBoostRemaining),
+		hasIdentity = options.hasIdentity == true,
+		value = finiteNumberOrZero(options.value),
+	}
+	-- The shadow artifact is bundled with the public bootstrap, while the
+	-- authorized payload build UUID is assigned by the server. Bind the
+	-- decision-only copy to this session's build before the normal VM verifier
+	-- runs; the gameplay payload itself remains manifest-bound.
+	artifact = cloneVmArtifact(artifact)
+	if artifact.buildId ~= self._authorizedBuildId and type(self._authorizedBuildId) == "string" then
+		artifact.buildId = self._authorizedBuildId
+	end
+	local runOk, callbackOk, vmOk, result = pcall(function()
+		local ok, value = self:_runVmArtifact(artifact,
+			normalized.level,
+			normalized.blocked,
+			normalized.duplicate,
+			normalized.expBoostRemaining,
+			normalized.hasIdentity,
+			normalized.value)
+		return true, ok, value
+	end)
+	if not runOk or callbackOk ~= true or vmOk ~= true or type(result) ~= "table" or type(result.allowed) ~= "boolean" then
+		stats.failures = stats.failures + 1
+		self:_notify("onShadowError", {
+			policy = "fruit",
+			calls = stats.calls,
+			comparisons = stats.comparisons,
+		})
+		return nil
+	end
+	if result.allowed ~= (authoritativeAllowed == true) then
+		stats.mismatches = stats.mismatches + 1
+		self:_notify("onShadowMismatch", {
+			policy = "fruit",
+			allowed = result.allowed,
+			authoritativeAllowed = authoritativeAllowed == true,
+			authoritativeReason = safeString(authoritativeReason or "", ""):sub(1, 64),
+			level = normalized.level,
+			blocked = normalized.blocked,
+			duplicate = normalized.duplicate,
+			expBoostRemaining = normalized.expBoostRemaining,
+			hasIdentity = normalized.hasIdentity,
+			value = normalized.value,
+			calls = stats.calls,
+			comparisons = stats.comparisons,
+			mismatches = stats.mismatches,
+		})
+	end
+	return nil
+end
+
 function RolandSecurity:downloadAuthorizedPayload()
 	self:_checkLeaseWatchdog()
 	if self._state ~= "ACTIVE" then
@@ -5698,6 +5809,9 @@ function RolandSecurity:getStatus()
 		buildId = self._authorizedBuildId,
 		nextHeartbeatSequence = self._heartbeatSequence,
 		leaseRemainingSeconds = leaseRemaining,
+		shadow = {
+			fruit = shallowCopy(self._shadowStats.fruit),
+		},
 	}
 end
 
@@ -5740,6 +5854,16 @@ local __RLS_BlacklistMessage = "YOUR KEY HAS BEEN BLACKLISTED FOR INTENTIONALLY 
 local function __RLS_StopSeaHub(reason)
 	if __RLS_StopBusy then return end
 	__RLS_StopBusy = true
+	local installedShadow = rawget(__RLS_Environment, "__RLS_FruitShadowInstall")
+	if type(installedShadow) == "table"
+		and type(installedShadow.policy) == "table"
+		and type(installedShadow.original) == "function" then
+		pcall(function()
+			installedShadow.policy.shouldCollect = installedShadow.original
+		end)
+	end
+	rawset(__RLS_Environment, "__RLS_FruitShadowInstall", nil)
+	rawset(__RLS_Environment, "__RLS_FruitCollectionShadow", nil)
 	rawset(__RLS_Environment, "__ROLAND_SECURITY_STOP_REASON", tostring(reason or "security-stop"))
 	local controller = rawget(__RLS_Environment, "SeaHubCleanController")
 	if type(controller) == "table" and type(controller.stop) == "function" then
@@ -5760,8 +5884,13 @@ end
 
 local function __RLS_EnforceSecurityKick(reason)
 	__RLS_StopSeaHub(reason)
-	if reason == "local-correlation" or reason == "server-decision" then
+	if reason == "local-correlation" then
 		__RLS_KickPlayer(__RLS_BlacklistMessage)
+	elseif reason == "server-decision" then
+		-- A server quarantine can be temporary (for example, a confirmed
+		-- challenge/rate violation). Do not claim the license was permanently
+		-- blacklisted unless the terminal decision explicitly says BLACKLIST.
+		__RLS_KickPlayer("YOUR ACCESS HAS BEEN TEMPORARILY QUARANTINED.")
 	end
 end
 
@@ -5803,6 +5932,7 @@ local runtime = RolandSecurity.new({
 	shutdown = { maxAttempts = 3, retryBaseSeconds = 0.25, maxRetrySeconds = 2 },
 	queue = { maxQueuedEvents = 48, maxEventsPerMinute = 60, dedupSeconds = 60, maxDedupEntries = 256, flushBurst = 3, flushIntervalSeconds = 4 },
 	leaseWatchdog = { graceSeconds = 3 },
+	shadowPolicies = { fruit = { enabled = true, sampleEvery = 16, artifact = "RLSVM1\n{\"format\":\"RLSVM1\",\"buildId\":\"00000000-0000-4000-8000-00000000b001\",\"entry\":0,\"opcodeMap\":{\"JUMP\":19,\"CONCAT\":32,\"GET_ARG\":45,\"JUMP_IF_FALSE\":58,\"GET_FIELD\":71,\"EQ\":84,\"SET_LOCAL\":97,\"AND\":110,\"RETURN\":123,\"MUL\":136,\"PUSH_CONST\":149,\"GET_GLOBAL\":162,\"NOT\":175,\"GTE\":188,\"ADD\":201,\"NE\":214,\"GT\":227,\"DUP\":240,\"CALL\":253,\"MAKE_TABLE\":266,\"NEG\":279,\"DIV\":292,\"OR\":305,\"SUB\":318,\"LT\":331,\"POP\":344,\"LTE\":357,\"GET_LOCAL\":370},\"code\":[[149,0],[45,0],[149,1],[188,0],[45,1],[175,0],[110,0],[45,2],[175,0],[110,0],[45,3],[149,2],[357,0],[45,4],[45,5],[149,3],[227,0],[110,0],[305,0],[110,0],[266,1],[123,1]],\"constantPages\":[{\"nonce\":\"jjTcsdIrN6WLZJe9mMqrbQ\",\"bytes\":\"oIKB2DlRCWpZP3LMkMea-1KlihB5PeV1fw\",\"sha256\":\"31028ea7a5a1d80adc2be8b2b334fd53ec047c6fb8de7c075f000135f1e0b683\"}],\"keyMask\":\"xcqw-pY7n-eHbJHv09VUnpgawiD9FEByyHs0kjYCMsY\",\"keyWrapped\":\"Ut-5G5BVsSDR5nP8fddnDbL-tBNgeBTLf3xfSuHZEpk\"}" } },
 	callbacks = {
 		onServerStop = __RLS_EnforceServerStop,
 		onQuarantine = __RLS_EnforceSecurityKick,
@@ -5810,6 +5940,9 @@ local runtime = RolandSecurity.new({
 		onStopped = __RLS_StopSeaHub,
 	},
 })
+rawset(__RLS_Environment, "__RLS_FruitCollectionShadow", function(options, allowed, reason)
+	return runtime:shadowFruitCollection(options, allowed, reason)
+end)
 __RLS_LicenseKey = nil
 rawset(__RLS_Environment, "__ROLAND_SECURITY_RUNTIME", runtime)
 local activated, activationError = runtime:start()
@@ -5818,5 +5951,24 @@ local executed, result = runtime:downloadAndExecuteAuthorizedPayload("=SeaHub")
 if not executed then
 	runtime:stop("payload-start-failed")
 	error("Roland Security payload failed: " .. tostring(result), 0)
+end
+do
+	local seaHub = rawget(__RLS_Environment, "SeaHub")
+	local runtimeFunctions = type(seaHub) == "table" and rawget(seaHub, "RuntimeFunctions") or nil
+	local fruitPolicy = type(runtimeFunctions) == "table" and rawget(runtimeFunctions, "FruitCollectionPolicy") or nil
+	local original = type(fruitPolicy) == "table" and rawget(fruitPolicy, "shouldCollect") or nil
+	if type(fruitPolicy) == "table" and type(original) == "function"
+		and rawget(__RLS_Environment, "__RLS_FruitShadowInstall") == nil
+		and true then
+		fruitPolicy.shouldCollect = function(options)
+			local allowed, reason = original(options)
+			local shadow = rawget(__RLS_Environment, "__RLS_FruitCollectionShadow")
+			if type(shadow) == "function" then
+				pcall(shadow, options, allowed, reason)
+			end
+			return allowed, reason
+		end
+		rawset(__RLS_Environment, "__RLS_FruitShadowInstall", { policy = fruitPolicy, original = original })
+	end
 end
 return result
