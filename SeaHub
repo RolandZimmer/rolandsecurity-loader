@@ -10,7 +10,7 @@ rawset(__RLS_Environment, "Script", nil)
 assert(type(__RLS_LicenseKey) == "string" and #__RLS_LicenseKey > 0, "script_key is required")
 
 local __RLS_PreflightBaseUrl = "https://api-staging-edb8.up.railway.app"
-local __RLS_PreflightClientVersion = "kaitun-2026.10.2"
+local __RLS_PreflightClientVersion = "kaitun-2026.10.3"
 local __RLS_PreflightBlacklistMessage = "YOUR KEY HAS BEEN BLACKLISTED FOR INTENTIONALLY TAKING OUR SOURCECODE."
 
 local function __RLS_PreflightStop(message)
@@ -4050,6 +4050,7 @@ function RolandSecurity.new(config)
 	self._shadowPolicies = config.shadowPolicies or {}
 	self._shadowStats = {
 		fruit = { calls = 0, comparisons = 0, mismatches = 0, failures = 0 },
+		raid = { calls = 0, comparisons = 0, mismatches = 0, failures = 0 },
 	}
 	self._shadowFruit = type(self._shadowPolicies.fruit) == "table"
 		and shallowCopy(self._shadowPolicies.fruit) or nil
@@ -5960,6 +5961,101 @@ function RolandSecurity:decideFruitCollection(options)
 	return data.allowed, data.reason
 end
 
+-- Returns one authoritative raid snapshot. All fields advance the same
+-- session-bound policy chain as fruit decisions, preventing cross-policy
+-- replay and keeping SeaHub's hot loop free of repeated local rule checks.
+function RolandSecurity:decideRaid(options)
+	local stats = self._shadowStats.raid
+	stats.calls = stats.calls + 1
+	if not self:_checkLeaseWatchdog() or self._state ~= "ACTIVE" then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = self._lastErrorCode or "RAID_POLICY_LEASE_UNAVAILABLE"
+		self:_notify("onProtectedPolicyError", "raid", self._lastErrorCode)
+		return nil, "security-unavailable"
+	end
+	if not self:_preActionGuard("vm") then
+		stats.failures = stats.failures + 1
+		self:_notify("onProtectedPolicyError", "raid", self._lastErrorCode or "PRE_ACTION_GUARD_BLOCKED")
+		return nil, "security-unavailable"
+	end
+	if not isIntegerInRange(self._policySequence, 1, 2147483647)
+		or type(self._policyChainDigest) ~= "string" or #self._policyChainDigest ~= 64
+		or type(options) ~= "table" then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = "RAID_POLICY_CHAIN_UNAVAILABLE"
+		return nil, "security-unavailable"
+	end
+	if not self:_acquirePolicyLock(5) then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = "RAID_POLICY_BUSY"
+		return nil, "security-unavailable"
+	end
+
+	local allowedTargets = {
+		["Dragon Claw"] = true, Superhuman = true, ["Death Step"] = true,
+		["Sharkman Karate"] = true, ["Electric Claw"] = true,
+		["Dragon Talon"] = true, Godhuman = true,
+	}
+	local styleTarget = allowedTargets[options.styleTarget] and options.styleTarget or nil
+	local maximumLevel = finiteNumberOrZero(options.maximumLevel)
+	if maximumLevel < 1 then maximumLevel = 2800 end
+	local normalized = {
+		level = finiteNumberOrZero(options.level),
+		fragments = finiteNumberOrZero(options.fragments),
+		maximumLevel = maximumLevel,
+		ownsDragonClaw = options.ownsDragonClaw == true,
+		expBoostActive = options.expBoostActive == true,
+		ownsGodhuman = options.ownsGodhuman == true,
+		inRaidSea = options.inRaidSea == true,
+		styleTarget = styleTarget,
+		styleTargetOwned = options.styleTargetOwned == true,
+	}
+	local sequence = self._policySequence
+	local requestBody = {
+		sequence = sequence,
+		previousDigest = self._policyChainDigest,
+		options = normalized,
+	}
+	local status, data, transportError = 0, nil, nil
+	for attempt = 1, 2 do
+		status, data, transportError = self:_post("/v1/runtime/policy/raid", requestBody, true)
+		if status == 200 or (status ~= 0 and status < 500) then break end
+		if attempt == 1 then self._adapters.wait(0.1) end
+	end
+	if status == 401 or status == 403 or TERMINAL_ERROR_CODES[responseErrorCode(data)] then
+		self._policyBusy = false
+		self:_handleTerminal(responseErrorCode(data) or "SESSION_DENIED", status)
+		stats.failures = stats.failures + 1
+		return nil, "security-unavailable"
+	end
+	local validTarget = data and (data.autoTarget == nil
+		or data.autoTarget == 2000 or data.autoTarget == 5000 or data.autoTarget == 10000)
+	if status ~= 200 or type(data) ~= "table" or data.sessionId ~= self._sessionId
+		or data.sequence ~= sequence or validTarget ~= true
+		or not isIntegerInRange(data.autoDeficit, 0, 1000000000)
+		or not isIntegerInRange(data.styleDeficit, 0, 1000000000)
+		or type(data.initialReserve) ~= "boolean" or type(data.canStart) ~= "boolean"
+		or type(data.chainDigest) ~= "string" or #data.chainDigest ~= 64
+		or data.chainDigest:match("^[a-fA-F0-9]+$") == nil then
+		self._policyBusy = false
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = responseErrorCode(data) or transportError or "RAID_POLICY_RESPONSE_INVALID"
+		self:_notify("onProtectedPolicyError", "raid", self._lastErrorCode)
+		return nil, "security-unavailable"
+	end
+	self._policySequence = sequence + 1
+	self._policyChainDigest = data.chainDigest:lower()
+	self._policyBusy = false
+	stats.comparisons = stats.comparisons + 1
+	return {
+		autoTarget = data.autoTarget,
+		autoDeficit = data.autoDeficit,
+		initialReserve = data.initialReserve,
+		canStart = data.canStart,
+		styleDeficit = data.styleDeficit,
+	}, "authorized"
+end
+
 function RolandSecurity:downloadAuthorizedPayload()
 	self:_checkLeaseWatchdog()
 	if self._state ~= "ACTIVE" then
@@ -6155,6 +6251,7 @@ function RolandSecurity:getStatus()
 		leaseRemainingSeconds = leaseRemaining,
 		shadow = {
 			fruit = shallowCopy(self._shadowStats.fruit),
+			raid = shallowCopy(self._shadowStats.raid),
 		},
 	}
 end
@@ -6192,7 +6289,7 @@ do
 end
 
 local __RLS_ProductCode = "KAITUN"
-local __RLS_LoaderUrl = "https://raw.githubusercontent.com/RolandZimmer/rolandsecurity-loader/main/SeaHub-bootstrap-kaitun-2026.10.2-r24.lua"
+local __RLS_LoaderUrl = "https://raw.githubusercontent.com/RolandZimmer/rolandsecurity-loader/main/SeaHub-bootstrap-kaitun-2026.10.3-r25a.lua"
 
 local __RLS_LocalPlayer = game:GetService("Players").LocalPlayer
 local __RLS_RobloxUserId = tostring(__RLS_LocalPlayer.UserId)
@@ -6302,6 +6399,7 @@ local function __RLS_StopSeaHub(reason)
 	rawset(__RLS_Environment, "__RLS_FruitShadowInstall", nil)
 	rawset(__RLS_Environment, "__RLS_FruitCollectionShadow", nil)
 	rawset(__RLS_Environment, "__RLS_FruitCollectionDecision", nil)
+	rawset(__RLS_Environment, "__RLS_RaidDecision", nil)
 	rawset(__RLS_Environment, "__ROLAND_SECURITY_STOP_REASON", tostring(reason or "security-stop"))
 	local controller = rawget(__RLS_Environment, "SeaHubCleanController")
 	if type(controller) == "table" and type(controller.stop) == "function" then
@@ -6356,7 +6454,7 @@ local runtime = RolandSecurity.new({
 	baseUrl = "https://api-staging-edb8.up.railway.app",
 	key = __RLS_LicenseKey,
 	resumeToken = __RLS_ResumeToken,
-	clientVersion = "kaitun-2026.10.2",
+	clientVersion = "kaitun-2026.10.3",
 	deployment = "production",
 	mode = "quarantine",
 	payloadPolicy = {
@@ -6387,6 +6485,9 @@ local runtime = RolandSecurity.new({
 })
 rawset(__RLS_Environment, "__RLS_FruitCollectionDecision", function(options)
 	return runtime:decideFruitCollection(options)
+end)
+rawset(__RLS_Environment, "__RLS_RaidDecision", function(options)
+	return runtime:decideRaid(options)
 end)
 rawset(__RLS_Environment, "__SEAHUB_UI_ENABLED", false)
 rawset(__RLS_Environment, "__SEAHUB_BLACK_SCREEN_ENABLED", false)
