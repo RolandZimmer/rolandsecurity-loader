@@ -4103,6 +4103,7 @@ function RolandSecurity.new(config)
 	self._heartbeatDueAt = math.huge
 	self._leaseDeadlineAt = math.huge
 	self._requestBusy = false
+	self._policyBusy = false
 	self._stopping = false
 	self._stopBusy = false
 	self._eventQueue = {}
@@ -4154,6 +4155,16 @@ function RolandSecurity:_acquireRequestLock(timeoutSeconds)
 		return false
 	end
 	self._requestBusy = true
+	return true
+end
+
+function RolandSecurity:_acquirePolicyLock(timeoutSeconds)
+	local deadline = self._adapters.clock() + (timeoutSeconds or 5)
+	while self._policyBusy and self._adapters.clock() < deadline do
+		self._adapters.wait(0.025)
+	end
+	if self._policyBusy then return false end
+	self._policyBusy = true
 	return true
 end
 
@@ -5892,6 +5903,11 @@ function RolandSecurity:decideFruitCollection(options)
 		stats.failures = stats.failures + 1
 		return false, "security-unavailable"
 	end
+	if not self:_acquirePolicyLock(5) then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = "FRUIT_POLICY_BUSY"
+		return false, "security-unavailable"
+	end
 	local normalized = {
 		level = finiteNumberOrZero(options.level),
 		blocked = options.blocked == true,
@@ -5913,6 +5929,7 @@ function RolandSecurity:decideFruitCollection(options)
 		if attempt == 1 then self._adapters.wait(0.1) end
 	end
 	if status == 401 or status == 403 or TERMINAL_ERROR_CODES[responseErrorCode(data)] then
+		self._policyBusy = false
 		self:_handleTerminal(responseErrorCode(data) or "SESSION_DENIED", status)
 		stats.failures = stats.failures + 1
 		return false, "security-unavailable"
@@ -5927,6 +5944,7 @@ function RolandSecurity:decideFruitCollection(options)
 		or #data.chainDigest ~= 64 or data.chainDigest:match("^[a-fA-F0-9]+$") == nil
 		or (data.allowed and data.reason ~= "eligible")
 		or (not data.allowed and data.reason == "eligible") then
+		self._policyBusy = false
 		stats.failures = stats.failures + 1
 		self._lastErrorCode = responseErrorCode(data) or transportError or "FRUIT_POLICY_RESPONSE_INVALID"
 		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode)
@@ -5934,6 +5952,7 @@ function RolandSecurity:decideFruitCollection(options)
 	end
 	self._policySequence = sequence + 1
 	self._policyChainDigest = data.chainDigest:lower()
+	self._policyBusy = false
 	stats.comparisons = stats.comparisons + 1
 	-- Compare the bundled VM only as a migration diagnostic. Its answer is not
 	-- used to authorize gameplay and therefore cannot bypass the backend.
@@ -6173,17 +6192,68 @@ do
 end
 
 local __RLS_ProductCode = "KAITUN"
+local __RLS_LoaderUrl = "https://raw.githubusercontent.com/RolandZimmer/rolandsecurity-loader/main/SeaHub-bootstrap-kaitun-2026.10.2-r23.lua"
 
 local __RLS_LocalPlayer = game:GetService("Players").LocalPlayer
 local __RLS_RobloxUserId = tostring(__RLS_LocalPlayer.UserId)
 local __RLS_ClientInstanceId = "roblox:" .. __RLS_RobloxUserId
 local __RLS_SessionDirectory = "RolandSecurity"
 local __RLS_SessionPath = __RLS_SessionDirectory .. "/" .. __RLS_ProductCode .. "-" .. __RLS_RobloxUserId .. ".session"
+local __RLS_LicensePath = __RLS_SessionDirectory .. "/" .. __RLS_ProductCode .. "-" .. __RLS_RobloxUserId .. ".license"
 local __RLS_IsFile = rawget(__RLS_Environment, "isfile")
 local __RLS_ReadFile = rawget(__RLS_Environment, "readfile")
 local __RLS_WriteFile = rawget(__RLS_Environment, "writefile")
 local __RLS_DeleteFile = rawget(__RLS_Environment, "delfile")
 local __RLS_MakeFolder = rawget(__RLS_Environment, "makefolder")
+
+local function __RLS_PersistLicenseKey(value)
+	if type(value) ~= "string" or value == "" or type(__RLS_WriteFile) ~= "function" then return false end
+	if type(__RLS_MakeFolder) == "function" then pcall(__RLS_MakeFolder, __RLS_SessionDirectory) end
+	local ok = pcall(__RLS_WriteFile, __RLS_LicensePath, value)
+	return ok
+end
+
+local function __RLS_ClearLicenseKey()
+	if type(__RLS_IsFile) ~= "function" then return end
+	local existsOk, exists = pcall(__RLS_IsFile, __RLS_LicensePath)
+	if not existsOk or exists ~= true then return end
+	if type(__RLS_DeleteFile) == "function" then
+		pcall(__RLS_DeleteFile, __RLS_LicensePath)
+	elseif type(__RLS_WriteFile) == "function" then
+		pcall(__RLS_WriteFile, __RLS_LicensePath, "")
+	end
+end
+
+local function __RLS_ResolveTeleportQueue()
+	for _, name in ipairs({ "queue_on_teleport", "queueonteleport" }) do
+		local candidate = rawget(__RLS_Environment, name)
+		if type(candidate) == "function" then return candidate end
+	end
+	for _, containerName in ipairs({ "syn", "fluxus" }) do
+		local container = rawget(__RLS_Environment, containerName)
+		if type(container) == "table" then
+			for _, name in ipairs({ "queue_on_teleport", "queueonteleport" }) do
+				local candidate = rawget(container, name)
+				if type(candidate) == "function" then return candidate end
+			end
+		end
+	end
+	return nil
+end
+
+local function __RLS_RegisterTeleportResume()
+	local queue = __RLS_ResolveTeleportQueue()
+	if type(queue) ~= "function" then return false, "teleport-queue-unavailable" end
+	local source = "repeat task.wait() until game:IsLoaded() and game:GetService('Players').LocalPlayer;"
+		.. "local e=type(getgenv)=='function' and getgenv() or _G;"
+		.. "local p=" .. string.format("%q", __RLS_LicensePath) .. ";"
+		.. "if type(isfile)~='function' or type(readfile)~='function' or not isfile(p) then error('Roland Security resume key unavailable',0) end;"
+		.. "local k=readfile(p);if type(k)~='string' or #k==0 then error('Roland Security resume key invalid',0) end;"
+		.. "e.script_key=k;k=nil;"
+		.. "loadstring(game:HttpGet(" .. string.format("%q", __RLS_LoaderUrl) .. "))()"
+	local ok, result = pcall(queue, source)
+	return ok, ok and nil or tostring(result)
+end
 
 local function __RLS_IsResumeToken(value)
 	return type(value) == "string"
@@ -6264,6 +6334,7 @@ end
 
 local function __RLS_EnforceServerStop(code)
 	__RLS_ClearSessionToken()
+	__RLS_ClearLicenseKey()
 	__RLS_StopSeaHub(code)
 	local normalized = tostring(code or "SESSION_TERMINATED"):upper()
 	if normalized:find("BLACKLIST", 1, true) then
@@ -6317,13 +6388,17 @@ local runtime = RolandSecurity.new({
 rawset(__RLS_Environment, "__RLS_FruitCollectionDecision", function(options)
 	return runtime:decideFruitCollection(options)
 end)
-__RLS_LicenseKey = nil
 rawset(__RLS_Environment, "__ROLAND_SECURITY_RUNTIME", runtime)
 local activated, activationError = runtime:start()
 if not activated then error("Roland Security activation failed: " .. tostring(activationError), 0) end
+if not __RLS_PersistLicenseKey(__RLS_LicenseKey) then runtime:stop("license-persist-failed"); error("Roland Security could not persist the rejoin key", 0) end
+__RLS_LicenseKey = nil
 local executed, result = runtime:downloadAndExecuteAuthorizedPayload("=SeaHub")
 if not executed then
 	runtime:stop("payload-start-failed")
 	error("Roland Security payload failed: " .. tostring(result), 0)
 end
+local queueOk, queueError = __RLS_RegisterTeleportResume()
+rawset(__RLS_Environment, "__RLS_TELEPORT_RESUME_STATUS", { registered = queueOk, error = queueError })
+for _, delaySeconds in ipairs({ 2, 5 }) do task.delay(delaySeconds, function() local ok, err = __RLS_RegisterTeleportResume(); rawset(__RLS_Environment, "__RLS_TELEPORT_RESUME_STATUS", { registered = ok, error = err }) end) end
 return result
