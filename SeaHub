@@ -4152,7 +4152,7 @@ function RolandSecurity:_getPayload(path)
 		math.floor(tonumber(self._payloadPolicy.maximumBytes) or 1048576),
 		65536,
 		4194304
-	)
+	) + 128
 	local requestOk, response = pcall(self._adapters.request, {
 		Url = joinPath(self._baseUrl, path),
 		Method = "GET",
@@ -4160,6 +4160,7 @@ function RolandSecurity:_getPayload(path)
 			Accept = "text/plain",
 			Authorization = "Bearer " .. self._sessionToken,
 			["X-Roland-Payload-Ticket"] = self._payloadTicket,
+			["X-Roland-Accepts-Payload-Watermark"] = "1",
 		},
 	})
 	self._payloadTicket = nil
@@ -5784,7 +5785,26 @@ function RolandSecurity:downloadAuthorizedPayload()
 		return false, "payload-response-mismatch"
 	end
 
-	local verified, verifyResult = self:verifyPayload(source, manifest)
+	if type(deliveryWatermark) ~= "string"
+		or deliveryWatermark:match("^RWM_[A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9][A-F0-9]_[A-F0-9]+$") == nil
+		or #deliveryWatermark ~= 53 then
+		self:reportSignal("L04_PAYLOAD_SIGNATURE_INVALID", { variant = "delivery-watermark-invalid" })
+		return false, "payload-watermark-invalid"
+	end
+	local signedSource = source
+	if source:sub(1, 7) ~= "RLSVM1\n" then
+		local trailer = "\n--[[ROLAND:" .. deliveryWatermark .. "]]"
+		if #source <= #trailer or source:sub(-#trailer) ~= trailer then
+			self:reportSignal("L04_PAYLOAD_SIGNATURE_INVALID", {
+				variant = "delivery-watermark-missing",
+				payloadBytes = #source,
+			})
+			return false, "payload-watermark-missing"
+		end
+		signedSource = source:sub(1, #source - #trailer)
+	end
+
+	local verified, verifyResult = self:verifyPayload(signedSource, manifest)
 	if not verified then
 		return false, verifyResult
 	end
