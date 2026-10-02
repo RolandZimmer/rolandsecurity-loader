@@ -4213,6 +4213,7 @@ function RolandSecurity:_rejectAcceptedActivation(data, status, code)
 		self:_post("/v1/runtime/deactivate", {}, true)
 	end
 	self._sessionToken = nil
+	self:_notify("onSessionCredentialCleared", "activation-response-rejected")
 	self._state = "DENIED"
 	self._lastErrorCode = code
 	self:_notify("onDenied", code, status)
@@ -4351,6 +4352,7 @@ function RolandSecurity:activate()
 
 	self._sessionId = data.sessionId
 	self._sessionToken = data.sessionToken
+	self:_notify("onSessionCredential", data.sessionId, data.sessionToken)
 	self._payloadTicket = data.payloadTicket
 	self._authorizedBuildId = data.buildId or self._payloadPolicy.buildId
 	self._authorizedBuild = authorizedBuild
@@ -4386,6 +4388,7 @@ function RolandSecurity:_handleTerminal(code, status)
 	self._stopping = true
 	self._sessionToken = nil
 	self._payloadTicket = nil
+	self:_notify("onSessionCredentialCleared", self._lastErrorCode)
 	self:_notify("onServerStop", self._lastErrorCode, status)
 end
 
@@ -5665,28 +5668,16 @@ function RolandSecurity:executeAuthorizedPayload(source, chunkName, ...)
 	return self:executePayload(source, self._authorizedBuild, chunkName, ...)
 end
 
--- Run the FruitCollectionPolicy artifact beside the real Lua policy.  This is
--- deliberately observation-only: the return values are never consumed by the
--- caller, and every failure is reduced to a bounded callback/stat counter.
-function RolandSecurity:shadowFruitCollection(options, authoritativeAllowed, authoritativeReason)
+function RolandSecurity:_evaluateFruitCollection(options)
 	local policy = self._shadowFruit
 	local artifact = self._shadowFruitArtifact
 	if (self._state ~= "ACTIVE" and self._state ~= "QUARANTINED")
 		or type(policy) ~= "table" or policy.enabled ~= true or type(artifact) ~= "table" then
-		return nil
+		return false, "fruit-policy-unavailable"
 	end
 	if type(options) ~= "table" then
-		return nil
+		return false, "fruit-policy-input-invalid"
 	end
-
-	local stats = self._shadowStats.fruit
-	stats.calls = stats.calls + 1
-	local sampleEvery = math.floor(tonumber(policy.sampleEvery) or 1)
-	sampleEvery = clamp(sampleEvery, 1, 1000)
-	if (stats.calls - 1) % sampleEvery ~= 0 then
-		return nil
-	end
-	stats.comparisons = stats.comparisons + 1
 	local normalized = {
 		level = finiteNumberOrZero(options.level),
 		blocked = options.blocked == true,
@@ -5713,7 +5704,36 @@ function RolandSecurity:shadowFruitCollection(options, authoritativeAllowed, aut
 			normalized.value)
 		return true, ok, value
 	end)
-	if not runOk or callbackOk ~= true or vmOk ~= true or type(result) ~= "table" or type(result.allowed) ~= "boolean" then
+	if not runOk or callbackOk ~= true or vmOk ~= true or type(result) ~= "table"
+		or type(result.allowed) ~= "boolean" or type(result.reason) ~= "string" then
+		return false, "fruit-policy-vm-invalid", normalized
+	end
+	local validReasons = {
+		level = true,
+		["progression-item"] = true,
+		duplicate = true,
+		["boost-unknown-fruit"] = true,
+		["boost-low-value"] = true,
+		eligible = true,
+	}
+	if validReasons[result.reason] ~= true then
+		return false, "fruit-policy-reason-invalid", normalized
+	end
+	return true, result, normalized
+end
+
+-- Kept as a bounded migration diagnostic for release comparisons. Gameplay
+-- now consumes decideFruitCollection(), not this observation-only callback.
+function RolandSecurity:shadowFruitCollection(options, authoritativeAllowed, authoritativeReason)
+	local policy = self._shadowFruit
+	if type(policy) ~= "table" or policy.enabled ~= true then return nil end
+	local stats = self._shadowStats.fruit
+	stats.calls = stats.calls + 1
+	local sampleEvery = clamp(math.floor(tonumber(policy.sampleEvery) or 1), 1, 1000)
+	if (stats.calls - 1) % sampleEvery ~= 0 then return nil end
+	stats.comparisons = stats.comparisons + 1
+	local evaluated, result, normalized = self:_evaluateFruitCollection(options)
+	if not evaluated then
 		stats.failures = stats.failures + 1
 		self:_notify("onShadowError", {
 			policy = "fruit",
@@ -5741,6 +5761,35 @@ function RolandSecurity:shadowFruitCollection(options, authoritativeAllowed, aut
 		})
 	end
 	return nil
+end
+
+-- Authoritative protected decision. Any lease, artifact, decode or output
+-- failure denies collection instead of falling back to plaintext policy logic.
+function RolandSecurity:decideFruitCollection(options)
+	local stats = self._shadowStats.fruit
+	stats.calls = stats.calls + 1
+	if not self:_checkLeaseWatchdog() or self._state ~= "ACTIVE" then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = self._lastErrorCode or "FRUIT_POLICY_LEASE_UNAVAILABLE"
+		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode)
+		return false, "security-unavailable"
+	end
+	local evaluated, result = self:_evaluateFruitCollection(options)
+	if not evaluated then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = safeString(result or "FRUIT_POLICY_UNAVAILABLE", "FRUIT_POLICY_UNAVAILABLE"):upper()
+		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode)
+		return false, "security-unavailable"
+	end
+	if (result.allowed and result.reason ~= "eligible")
+		or (not result.allowed and result.reason == "eligible") then
+		stats.failures = stats.failures + 1
+		self._lastErrorCode = "FRUIT_POLICY_RESULT_INCONSISTENT"
+		self:_notify("onProtectedPolicyError", "fruit", self._lastErrorCode)
+		return false, "security-unavailable"
+	end
+	stats.comparisons = stats.comparisons + 1
+	return result.allowed, result.reason
 end
 
 function RolandSecurity:downloadAuthorizedPayload()
@@ -5902,6 +5951,7 @@ function RolandSecurity:stop(reason)
 	self._payloadTicket = nil
 	self._state = "STOPPED"
 	self._stopBusy = false
+	self:_notify("onSessionCredentialCleared", safeString(reason or "client-stop", "client-stop"):sub(1, 128))
 	self:_notify("onStopped", safeString(reason or "client-stop", "client-stop"):sub(1, 128), status)
 	return true
 end
@@ -5969,23 +6019,66 @@ do
 	end
 end
 
+local __RLS_ProductCode = "KAITUN"
 
+local __RLS_LocalPlayer = game:GetService("Players").LocalPlayer
+local __RLS_RobloxUserId = tostring(__RLS_LocalPlayer.UserId)
+local __RLS_ClientInstanceId = "roblox:" .. __RLS_RobloxUserId
+local __RLS_SessionDirectory = "RolandSecurity"
+local __RLS_SessionPath = __RLS_SessionDirectory .. "/" .. __RLS_ProductCode .. "-" .. __RLS_RobloxUserId .. ".session"
+local __RLS_IsFile = rawget(__RLS_Environment, "isfile")
+local __RLS_ReadFile = rawget(__RLS_Environment, "readfile")
+local __RLS_WriteFile = rawget(__RLS_Environment, "writefile")
+local __RLS_DeleteFile = rawget(__RLS_Environment, "delfile")
+local __RLS_MakeFolder = rawget(__RLS_Environment, "makefolder")
+
+local function __RLS_IsResumeToken(value)
+	return type(value) == "string"
+		and #value >= 84 and #value <= 128
+		and value:match("^RSS_[%x%-]+_[%w_%-]+$") ~= nil
+end
+
+local function __RLS_ReadSessionToken()
+	if type(__RLS_IsFile) ~= "function" or type(__RLS_ReadFile) ~= "function" then return nil end
+	local existsOk, exists = pcall(__RLS_IsFile, __RLS_SessionPath)
+	if not existsOk or exists ~= true then return nil end
+	local readOk, value = pcall(__RLS_ReadFile, __RLS_SessionPath)
+	if not readOk or not __RLS_IsResumeToken(value) then return nil end
+	return value
+end
+
+local function __RLS_PersistSessionToken(sessionId, token)
+	if type(sessionId) ~= "string" or type(token) ~= "string"
+		or not __RLS_IsResumeToken(token)
+		or token:sub(1, #sessionId + 5) ~= "RSS_" .. sessionId .. "_"
+		or type(__RLS_WriteFile) ~= "function" then return end
+	if type(__RLS_MakeFolder) == "function" then
+		pcall(__RLS_MakeFolder, __RLS_SessionDirectory)
+	end
+	pcall(__RLS_WriteFile, __RLS_SessionPath, token)
+end
+
+local function __RLS_ClearSessionToken()
+	if type(__RLS_IsFile) ~= "function" then return end
+	local existsOk, exists = pcall(__RLS_IsFile, __RLS_SessionPath)
+	if not existsOk or exists ~= true then return end
+	if type(__RLS_DeleteFile) == "function" then
+		pcall(__RLS_DeleteFile, __RLS_SessionPath)
+	elseif type(__RLS_WriteFile) == "function" then
+		pcall(__RLS_WriteFile, __RLS_SessionPath, "")
+	end
+end
+
+local __RLS_ResumeToken = __RLS_ReadSessionToken()
 local __RLS_StopBusy = false
 local __RLS_KickBusy = false
 local __RLS_BlacklistMessage = "YOUR KEY HAS BEEN BLACKLISTED FOR INTENTIONALLY TAKING OUR SOURCECODE."
 local function __RLS_StopSeaHub(reason)
 	if __RLS_StopBusy then return end
 	__RLS_StopBusy = true
-	local installedShadow = rawget(__RLS_Environment, "__RLS_FruitShadowInstall")
-	if type(installedShadow) == "table"
-		and type(installedShadow.policy) == "table"
-		and type(installedShadow.original) == "function" then
-		pcall(function()
-			installedShadow.policy.shouldCollect = installedShadow.original
-		end)
-	end
 	rawset(__RLS_Environment, "__RLS_FruitShadowInstall", nil)
 	rawset(__RLS_Environment, "__RLS_FruitCollectionShadow", nil)
+	rawset(__RLS_Environment, "__RLS_FruitCollectionDecision", nil)
 	rawset(__RLS_Environment, "__ROLAND_SECURITY_STOP_REASON", tostring(reason or "security-stop"))
 	local controller = rawget(__RLS_Environment, "SeaHubCleanController")
 	if type(controller) == "table" and type(controller.stop) == "function" then
@@ -6017,6 +6110,7 @@ local function __RLS_EnforceSecurityKick(reason)
 end
 
 local function __RLS_EnforceServerStop(code)
+	__RLS_ClearSessionToken()
 	__RLS_StopSeaHub(code)
 	local normalized = tostring(code or "SESSION_TERMINATED"):upper()
 	if normalized:find("BLACKLIST", 1, true) then
@@ -6037,7 +6131,8 @@ end
 local runtime = RolandSecurity.new({
 	baseUrl = "https://api-staging-edb8.up.railway.app",
 	key = __RLS_LicenseKey,
-	clientVersion = "kaitun-2026.10.1",
+	resumeToken = __RLS_ResumeToken,
+	clientVersion = "kaitun-2026.10.2",
 	deployment = "production",
 	mode = "quarantine",
 	payloadPolicy = {
@@ -6047,6 +6142,7 @@ local runtime = RolandSecurity.new({
 		maximumBytes = 4194304,
 	},
 	detectors = {
+		clientInstanceId = __RLS_ClientInstanceId,
 		hashSha256 = __RLS_HashSha256,
 		verifyPayloadSignature = __RLS_VerifyPayloadSignature,
 	},
@@ -6054,16 +6150,18 @@ local runtime = RolandSecurity.new({
 	shutdown = { maxAttempts = 3, retryBaseSeconds = 0.25, maxRetrySeconds = 2 },
 	queue = { maxQueuedEvents = 32, maxEventsPerMinute = 30, dedupSeconds = 90, maxDedupEntries = 128, flushBurst = 3, flushIntervalSeconds = 8 },
 	leaseWatchdog = { graceSeconds = 3 },
-	shadowPolicies = { fruit = { enabled = true, sampleEvery = 16, artifact = "RLSVM1\n{\"format\":\"RLSVM1\",\"buildId\":\"00000000-0000-4000-8000-00000000b001\",\"entry\":0,\"opcodeMap\":{\"JUMP\":19,\"CONCAT\":32,\"GET_ARG\":45,\"JUMP_IF_FALSE\":58,\"GET_FIELD\":71,\"EQ\":84,\"SET_LOCAL\":97,\"AND\":110,\"RETURN\":123,\"MUL\":136,\"PUSH_CONST\":149,\"GET_GLOBAL\":162,\"NOT\":175,\"GTE\":188,\"ADD\":201,\"NE\":214,\"GT\":227,\"DUP\":240,\"CALL\":253,\"MAKE_TABLE\":266,\"NEG\":279,\"DIV\":292,\"OR\":305,\"SUB\":318,\"LT\":331,\"POP\":344,\"LTE\":357,\"GET_LOCAL\":370},\"code\":[[149,0],[45,0],[149,1],[188,0],[45,1],[175,0],[110,0],[45,2],[175,0],[110,0],[45,3],[149,2],[357,0],[45,4],[45,5],[149,3],[227,0],[110,0],[305,0],[110,0],[266,1],[123,1]],\"constantPages\":[{\"nonce\":\"jjTcsdIrN6WLZJe9mMqrbQ\",\"bytes\":\"oIKB2DlRCWpZP3LMkMea-1KlihB5PeV1fw\",\"sha256\":\"31028ea7a5a1d80adc2be8b2b334fd53ec047c6fb8de7c075f000135f1e0b683\"}],\"keyMask\":\"xcqw-pY7n-eHbJHv09VUnpgawiD9FEByyHs0kjYCMsY\",\"keyWrapped\":\"Ut-5G5BVsSDR5nP8fddnDbL-tBNgeBTLf3xfSuHZEpk\"}" } },
+	shadowPolicies = { fruit = { enabled = true, sampleEvery = 16, artifact = "RLSVM1\n{\"format\":\"RLSVM1\",\"buildId\":\"00000000-0000-4000-8000-00000000b001\",\"entry\":0,\"opcodeMap\":{\"LTE\":19,\"OR\":32,\"NOT\":45,\"RETURN\":58,\"DUP\":71,\"NEG\":84,\"GTE\":97,\"MUL\":110,\"SET_LOCAL\":123,\"GET_ARG\":136,\"POP\":149,\"JUMP_IF_FALSE\":162,\"DIV\":175,\"ADD\":188,\"EQ\":201,\"GET_FIELD\":214,\"LT\":227,\"NE\":240,\"CONCAT\":253,\"GT\":266,\"SUB\":279,\"CALL\":292,\"AND\":305,\"MAKE_TABLE\":318,\"JUMP\":331,\"GET_LOCAL\":344,\"PUSH_CONST\":357,\"GET_GLOBAL\":370},\"code\":[[136,0],[357,0],[97,0],[136,1],[45,0],[305,0],[136,2],[45,0],[305,0],[136,3],[357,1],[19,0],[136,4],[136,5],[357,2],[266,0],[305,0],[32,0],[305,0],[123,0],[136,0],[357,0],[227,0],[357,3],[305,0],[136,1],[357,4],[305,0],[32,0],[136,2],[357,5],[305,0],[32,0],[136,3],[357,1],[266,0],[136,4],[45,0],[305,0],[357,6],[305,0],[32,0],[136,3],[357,1],[266,0],[136,5],[357,2],[19,0],[305,0],[357,7],[305,0],[32,0],[357,8],[32,0],[123,1],[357,9],[344,0],[357,10],[344,1],[318,2],[58,1]],\"constantPages\":[{\"nonce\":\"P_VwXvWhNZWaykpGI0p-4A\",\"bytes\":\"rmTpSeCZbBf5IOFC5I7DVLJny7SgOm8hx5gn877xOiWFOqHeDiUYM6v_SqMERT2MIdWFOAocwjFsNeBodavM_FGrADvEj7WyDX_EtWqkwvjliy336xBZr43hwBUVT8xGnxvFArW0xIcr0POEQFubTovcWdd8Fm5CJ9C8yw\",\"sha256\":\"0a42f565b583eb8fd2d78e8270402a6807ac7cd1482b9e23c22010f0c85407a7\"}],\"keyMask\":\"x0NU-DU7bXqeA8-Dw-jpm7mgsJrBo9cUmVTgzfiiBwE\",\"keyWrapped\":\"qKhGgN03HANEOLddJjG0a31ihCPsiv1YyszB-kxWx3A\"}" } },
 	callbacks = {
+		onSessionCredential = __RLS_PersistSessionToken,
+		onSessionCredentialCleared = __RLS_ClearSessionToken,
 		onServerStop = __RLS_EnforceServerStop,
 		onQuarantine = __RLS_EnforceSecurityKick,
-		onLeaseExpired = __RLS_StopSeaHub,
-		onStopped = __RLS_StopSeaHub,
+		onLeaseExpired = function(reason) __RLS_ClearSessionToken(); __RLS_StopSeaHub(reason) end,
+		onStopped = function(reason) __RLS_ClearSessionToken(); __RLS_StopSeaHub(reason) end,
 	},
 })
-rawset(__RLS_Environment, "__RLS_FruitCollectionShadow", function(options, allowed, reason)
-	return runtime:shadowFruitCollection(options, allowed, reason)
+rawset(__RLS_Environment, "__RLS_FruitCollectionDecision", function(options)
+	return runtime:decideFruitCollection(options)
 end)
 __RLS_LicenseKey = nil
 rawset(__RLS_Environment, "__ROLAND_SECURITY_RUNTIME", runtime)
@@ -6073,24 +6171,5 @@ local executed, result = runtime:downloadAndExecuteAuthorizedPayload("=SeaHub")
 if not executed then
 	runtime:stop("payload-start-failed")
 	error("Roland Security payload failed: " .. tostring(result), 0)
-end
-do
-	local seaHub = rawget(__RLS_Environment, "SeaHub")
-	local runtimeFunctions = type(seaHub) == "table" and rawget(seaHub, "RuntimeFunctions") or nil
-	local fruitPolicy = type(runtimeFunctions) == "table" and rawget(runtimeFunctions, "FruitCollectionPolicy") or nil
-	local original = type(fruitPolicy) == "table" and rawget(fruitPolicy, "shouldCollect") or nil
-	if type(fruitPolicy) == "table" and type(original) == "function"
-		and rawget(__RLS_Environment, "__RLS_FruitShadowInstall") == nil
-		and true then
-		fruitPolicy.shouldCollect = function(options)
-			local allowed, reason = original(options)
-			local shadow = rawget(__RLS_Environment, "__RLS_FruitCollectionShadow")
-			if type(shadow) == "function" then
-				pcall(shadow, options, allowed, reason)
-			end
-			return allowed, reason
-		end
-		rawset(__RLS_Environment, "__RLS_FruitShadowInstall", { policy = fruitPolicy, original = original })
-	end
 end
 return result
